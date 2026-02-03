@@ -469,6 +469,8 @@ class DeeplinkCollector:
         # Fallback даты: март и октябрь следующего года
         fallback_dates = [
             ('2026-03-01', '2026-03-02', 'март'),
+            ('2026-04-01', '2026-04-02', 'апрель'),
+            ('2026-05-01', '2026-05-02', 'май'),
             ('2026-10-01', '2026-10-08', 'октябрь (неделя)'),
         ]
         
@@ -994,13 +996,18 @@ class CombinedChecker:
         print(f"📋 Загружено {len(self.hotels)} отелей")
     
     def load_checked(self):
-        """Загрузить уже проверенные отели из CSV."""
+        """Загрузить уже проверенные отели из CSV (кроме no_rooms - их перепроверяем)."""
+        no_rooms_count = 0
         if self.results_file.exists():
             with open(self.results_file, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
+                    if row.get('status') == 'no_rooms':
+                        no_rooms_count += 1
+                        continue  # Не добавляем - будем перепроверять
                     self.checked_ids.add(row['hotel_id'])
-            print(f"📊 Уже проверено: {len(self.checked_ids)} отелей")
+            print(f"📊 Уже проверено: {len(self.checked_ids)} отелей" + 
+                  (f" (+ {no_rooms_count} no_rooms для перепроверки)" if no_rooms_count else ""))
     
     def start_browser(self):
         """Запустить браузер."""
@@ -1035,6 +1042,8 @@ class CombinedChecker:
         # Fallback даты
         fallback_dates = [
             ('2026-03-01', '2026-03-02'),
+            ('2026-04-01', '2026-04-02'),
+            ('2026-05-01', '2026-05-02'),
             ('2026-10-01', '2026-10-08'),
         ]
         
