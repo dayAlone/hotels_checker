@@ -103,7 +103,8 @@ class PageAnalyzer:
     @staticmethod
     def analyze(snapshot: str, page_title: str, hotel_name: str, expected_date: str,
                 adults: int = 1, children_count: int = 0, deeplink: str = '',
-                expected_price: float = None, children_ages: list = None) -> dict:
+                expected_price: float = None, children_ages: list = None,
+                guests_dropdown_text: str = '') -> dict:
         """
         Анализ страницы по критериям.
         
@@ -356,10 +357,17 @@ class PageAnalyzer:
                 results['children_ages_on_page'] = ''
             
             # Проверяем наличие выбора детей в виджете
+            # Ищем маркеры ТОЛЬКО в тексте дропдауна гостей (а не во всём snapshot,
+            # где "дети" может встречаться в описании отеля)
             children_dropdown_markers = ['ребён', 'ребен', 'детей', 'дети', 'добавить ребёнка', 
                                          'добавить ребенка', 'возраст ребёнка', 'возраст ребенка',
                                          'младше']
-            has_children_ui = any(m in snapshot_lower for m in children_dropdown_markers)
+            dropdown_text_lower = guests_dropdown_text.lower() if guests_dropdown_text else ''
+            if dropdown_text_lower:
+                has_children_ui = any(m in dropdown_text_lower for m in children_dropdown_markers)
+            else:
+                # Если дропдаун не открылся (нет поля гостей / < 2 inputs) — детей выбрать нельзя
+                has_children_ui = False
             
             results['children_selectable'] = str(has_children_ui)
         
@@ -944,7 +952,10 @@ class BrowserChecker:
     def _get_tl_frame(self):
         """Найти TL iframe: сначала через page.frames, потом через frame_locator."""
         # Способ 1: через page.frames (работает для некоторых сайтов)
+        main_frame = self.page.main_frame
         for frame in self.page.frames:
+            if frame == main_frame:
+                continue  # пропускаем главный фрейм (b.tlintegration.com/metasearch)
             if 'tlintegration' in frame.url or 'travelline' in frame.url:
                 if 'reputation' in frame.url:
                     continue
@@ -1137,6 +1148,7 @@ class BrowserChecker:
             page_content = self.get_page_text()
             
             # Если есть дети — кликаем по полю гостей для проверки возраста
+            guests_detail = ''
             if children_ages:
                 guests_detail = self.interact_with_guests()
                 if guests_detail:
@@ -1152,7 +1164,8 @@ class BrowserChecker:
                 children_count=children_count,
                 deeplink=deeplink,
                 expected_price=expected_price,
-                children_ages=children_ages
+                children_ages=children_ages,
+                guests_dropdown_text=guests_detail
             )
             
             # Сохраняем результат
@@ -1495,7 +1508,10 @@ class CombinedChecker:
     
     def _get_tl_frame(self):
         """Найти TL iframe: сначала через page.frames, потом через frame_locator."""
+        main_frame = self.page.main_frame
         for frame in self.page.frames:
+            if frame == main_frame:
+                continue  # пропускаем главный фрейм (b.tlintegration.com/metasearch)
             if 'tlintegration' in frame.url or 'travelline' in frame.url:
                 # Пропускаем reputation-widget, ищем именно booking
                 if 'reputation' in frame.url:
@@ -1667,6 +1683,7 @@ class CombinedChecker:
             page_content = self.get_page_text()
             
             # Если есть дети — кликаем по полю гостей для получения деталей
+            guests_detail = ''
             if self.children_ages:
                 guests_detail = self.interact_with_guests()
                 if guests_detail:
@@ -1681,7 +1698,8 @@ class CombinedChecker:
                 children_count=children_count,
                 deeplink=deeplink,
                 expected_price=price,
-                children_ages=self.children_ages
+                children_ages=self.children_ages,
+                guests_dropdown_text=guests_detail
             )
             
             status = PageAnalyzer.get_status(analysis)
