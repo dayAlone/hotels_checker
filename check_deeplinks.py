@@ -338,22 +338,22 @@ class PageAnalyzer:
                 if any(p in snapshot_lower for p in age_patterns):
                     found_ages.append(age)
             
-            # Ищем возрастное ограничение: "младше N лет", "до N лет"
+            # Ищем возрастное ограничение: "младше N лет/года/год", "до N лет/года"
             age_limit = None
-            age_limit_match = re.search(r'(?:младше|до)\s+(\d+)\s+лет', snapshot_lower)
+            age_limit_match = re.search(r'(?:младше|до)\s+(\d+)\s+(?:лет|года?)', snapshot_lower)
             if age_limit_match:
                 age_limit = int(age_limit_match.group(1))
             
             if found_ages:
                 results['children_ages_on_page'] = ','.join(str(a) for a in found_ages)
             elif age_limit is not None:
-                results['children_ages_on_page'] = f'limit_{age_limit}'
+                results['children_ages_on_page'] = str(age_limit)
                 # Если запрошенный возраст >= лимита, ребёнок не пройдёт
                 for age in children_ages:
                     if age >= age_limit:
                         errors.append(f'Ребёнок {age} лет >= ограничение "младше {age_limit} лет"')
             else:
-                results['children_ages_on_page'] = 'not_found'
+                results['children_ages_on_page'] = ''
             
             # Проверяем наличие выбора детей в виджете
             children_dropdown_markers = ['ребён', 'ребен', 'детей', 'дети', 'добавить ребёнка', 
@@ -361,15 +361,7 @@ class PageAnalyzer:
                                          'младше']
             has_children_ui = any(m in snapshot_lower for m in children_dropdown_markers)
             
-            if has_children_ui:
-                results['children_selectable'] = 'yes'
-                if age_limit is not None:
-                    results['children_selectable'] = f'yes_limit_{age_limit}'
-            elif has_any_guest_info:
-                # Гостевая секция есть, но детей выбрать нельзя
-                results['children_selectable'] = 'no'
-            else:
-                results['children_selectable'] = 'unknown'
+            results['children_selectable'] = str(has_children_ui)
         
         results['error_details'] = '; '.join(errors) if errors else ''
         
@@ -1012,18 +1004,46 @@ class BrowserChecker:
         except:
             return ''
     
+    def _dismiss_overlays(self):
+        """Закрыть cookie-баннеры и другие оверлеи на основной странице."""
+        try:
+            self.page.evaluate('''() => {
+                const selectors = [
+                    '#cookie-notification', '.cookie-notification', '.cookie-banner',
+                    '.cookies-common', '#cookies', '.cookie-consent',
+                    '[class*="cookie"]', '[id*="cookie"]',
+                    '.overlay', '.popup-overlay', '.modal-backdrop'
+                ];
+                for (const sel of selectors) {
+                    document.querySelectorAll(sel).forEach(el => el.remove());
+                }
+                document.querySelectorAll('header, nav, .header, .navbar').forEach(el => {
+                    const s = getComputedStyle(el);
+                    if (s.position === 'fixed' || s.position === 'sticky') {
+                        el.style.position = 'relative';
+                    }
+                });
+            }''')
+        except:
+            pass
+    
     def interact_with_guests(self) -> str:
         """Кликнуть по полю гостей в TL виджете и прочитать dropdown."""
         frame_type, frame = self._get_tl_frame()
         if not frame:
             return ''
         
+        self._dismiss_overlays()
+        
         try:
             if frame_type == 'frame':
                 inputs = frame.query_selector_all('input')
                 if len(inputs) < 2:
                     return ''
-                inputs[1].click()
+                try:
+                    inputs[1].click(timeout=3000)
+                except:
+                    inputs[1].click(force=True)
                 time.sleep(1.5)
                 body_text = frame.locator('body').inner_text(timeout=3000)
                 
@@ -1038,7 +1058,7 @@ class BrowserChecker:
                         pass
                 
                 try:
-                    inputs[0].click()
+                    inputs[0].click(force=True)
                     time.sleep(0.3)
                 except:
                     pass
@@ -1049,7 +1069,10 @@ class BrowserChecker:
                 inp_count = frame.locator('input').count()
                 if inp_count < 2:
                     return ''
-                frame.locator('input').nth(1).click(timeout=3000)
+                try:
+                    frame.locator('input').nth(1).click(timeout=3000)
+                except:
+                    frame.locator('input').nth(1).click(timeout=3000, force=True)
                 time.sleep(1.5)
                 body_text = frame.locator('body').inner_text(timeout=5000)
                 
@@ -1064,7 +1087,7 @@ class BrowserChecker:
                         pass
                 
                 try:
-                    frame.locator('input').nth(0).click(timeout=2000)
+                    frame.locator('input').nth(0).click(timeout=2000, force=True)
                     time.sleep(0.3)
                 except:
                     pass
@@ -1276,7 +1299,11 @@ class CombinedChecker:
                             skip = True
                         elif self.recheck == 'failed' and row.get('status') in ('failed', 'partial'):
                             skip = True
-                        elif self.recheck == 'deeplinks' and row.get('deeplink', '').strip():
+                        elif self.recheck == 'deeplinks' and (row.get('deeplink') or '').strip():
+                            skip = True
+                        elif self.recheck == 'children' and row.get('children_selectable') in ('False', '') and row.get('guests_info') in ('children_as_adults', 'mismatch', 'not_available'):
+                            skip = True
+                        elif self.recheck == 'children' and row.get('children_selectable') == 'True' and not row.get('children_ages_on_page'):
                             skip = True
                         elif self.recheck == 'all':
                             skip = True
@@ -1524,18 +1551,47 @@ class CombinedChecker:
         except:
             return ''
     
+    def _dismiss_overlays(self):
+        """Закрыть cookie-баннеры и другие оверлеи на основной странице."""
+        try:
+            self.page.evaluate('''() => {
+                const selectors = [
+                    '#cookie-notification', '.cookie-notification', '.cookie-banner',
+                    '.cookies-common', '#cookies', '.cookie-consent',
+                    '[class*="cookie"]', '[id*="cookie"]',
+                    '.overlay', '.popup-overlay', '.modal-backdrop'
+                ];
+                for (const sel of selectors) {
+                    document.querySelectorAll(sel).forEach(el => el.remove());
+                }
+                document.querySelectorAll('header, nav, .header, .navbar').forEach(el => {
+                    const s = getComputedStyle(el);
+                    if (s.position === 'fixed' || s.position === 'sticky') {
+                        el.style.position = 'relative';
+                    }
+                });
+            }''')
+        except:
+            pass
+    
     def interact_with_guests(self) -> str:
         """Кликнуть по полю гостей в TL виджете и прочитать dropdown."""
         frame_type, frame = self._get_tl_frame()
         if not frame:
             return ''
         
+        self._dismiss_overlays()
+        
         try:
             if frame_type == 'frame':
                 inputs = frame.query_selector_all('input')
                 if len(inputs) < 2:
                     return ''
-                inputs[1].click()
+                # Сначала обычный клик, fallback на force
+                try:
+                    inputs[1].click(timeout=3000)
+                except:
+                    inputs[1].click(force=True)
                 time.sleep(1.5)
                 body_text = frame.locator('body').inner_text(timeout=3000)
                 
@@ -1549,7 +1605,7 @@ class CombinedChecker:
                         pass
                 
                 try:
-                    inputs[0].click()
+                    inputs[0].click(force=True)
                     time.sleep(0.3)
                 except:
                     pass
@@ -1560,7 +1616,11 @@ class CombinedChecker:
                 inp_count = frame.locator('input').count()
                 if inp_count < 2:
                     return ''
-                frame.locator('input').nth(1).click(timeout=3000)
+                # Сначала обычный клик, fallback на force
+                try:
+                    frame.locator('input').nth(1).click(timeout=3000)
+                except:
+                    frame.locator('input').nth(1).click(timeout=3000, force=True)
                 time.sleep(1.5)
                 body_text = frame.locator('body').inner_text(timeout=5000)
                 
@@ -1574,7 +1634,7 @@ class CombinedChecker:
                         pass
                 
                 try:
-                    frame.locator('input').nth(0).click(timeout=2000)
+                    frame.locator('input').nth(0).click(timeout=2000, force=True)
                     time.sleep(0.3)
                 except:
                     pass
@@ -2151,8 +2211,8 @@ def main():
     check_parser.add_argument('--hotels', type=str, default='hotels_id_name.json', help='Файл с отелями')
     check_parser.add_argument('--output', type=str, default='deeplink_results.csv', help='Выходной CSV')
     check_parser.add_argument('--gui', action='store_true', help='Показать окно браузера')
-    check_parser.add_argument('--recheck', type=str, choices=['guests', 'price', 'failed', 'all', 'deeplinks'],
-                              help='Перепроверить: guests/price/failed/all/deeplinks')
+    check_parser.add_argument('--recheck', type=str, choices=['guests', 'price', 'failed', 'all', 'deeplinks', 'children'],
+                              help='Перепроверить: guests/price/failed/all/deeplinks/children')
     check_parser.add_argument('--from-csv', action='store_true',
                               help='Использовать диплинки из CSV вместо API (комбинируется с --recheck)')
     

@@ -12,6 +12,7 @@
 - Fallback без детей: если с детьми комнат нет — пробует без детей
 - Обработка rate limits с автоматическим ожиданием
 - Перепроверка по существующим диплинкам из CSV (без API-запросов)
+- Автоматическое удаление cookie-баннеров и оверлеев перед взаимодействием с виджетом
 - Восстановление страницы браузера после ошибок навигации
 - Замер времени загрузки виджета
 
@@ -73,6 +74,7 @@ python3 check_deeplinks.py check \
 | `guests` | Отели с `check_guests_correct=False` |
 | `price` | Отели с `check_price_correct=False` |
 | `failed` | Отели со статусом `failed` или `partial` |
+| `children` | Отели с неточным определением детей (sel=False при children_as_adults, или sel=True без возраста) |
 | `all` | Все отели |
 | `deeplinks` | Все отели с диплинками (без API) |
 
@@ -85,6 +87,13 @@ python3 check_deeplinks.py check \
   --output results.csv \
   --adults 1 --children 7 \
   --recheck guests --from-csv
+
+# Перепроверить определение детей по существующим диплинкам
+python3 check_deeplinks.py check \
+  --hotels hotels_id_name.json \
+  --output results.csv \
+  --adults 1 --children 7 \
+  --recheck children --from-csv
 
 # Перепроверить все неудачные через API
 python3 check_deeplinks.py check \
