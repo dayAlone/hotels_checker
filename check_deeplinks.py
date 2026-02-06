@@ -850,7 +850,7 @@ class BrowserChecker:
         
         self.checked_ids = set()
         if self.results_file.exists():
-            with open(self.results_file, 'r', encoding='utf-8') as f:
+            with open(self.results_file, 'r', encoding='utf-8', errors='replace') as f:
                 reader = csv.DictReader(f)
                 self.checked_ids = {row['hotel_id'] for row in reader}
         
@@ -1097,7 +1097,14 @@ class BrowserChecker:
         
         try:
             # Переходим на страницу
-            self.page.goto(deeplink, timeout=15000, wait_until='domcontentloaded')
+            try:
+                self.page.goto(deeplink, timeout=15000, wait_until='domcontentloaded')
+            except Exception as nav_err:
+                err_msg = str(nav_err).lower()
+                if 'interrupted' in err_msg or 'navigating' in err_msg:
+                    time.sleep(2)
+                else:
+                    raise
             
             # Ждём загрузки виджета с правильными датами
             widget_loaded = self.wait_for_widget(expected_date=arrival_date)
@@ -1142,11 +1149,24 @@ class BrowserChecker:
         except PlaywrightTimeout:
             result['error'] = 'Timeout загрузки страницы'
             self.saver.save_skipped(hotel_id, hotel_name, 'failed', 'Timeout', deeplink=deeplink)
+            self._recover_page()
         except Exception as e:
-            result['error'] = str(e)[:100]
-            self.saver.save_skipped(hotel_id, hotel_name, 'failed', str(e)[:100], deeplink=deeplink)
+            result['error'] = str(e)[:200]
+            self.saver.save_skipped(hotel_id, hotel_name, 'failed', str(e)[:200], deeplink=deeplink)
+            self._recover_page()
         
         return result
+    
+    def _recover_page(self):
+        """Сбросить страницу после ошибки навигации."""
+        try:
+            self.page.goto('about:blank', timeout=5000)
+        except:
+            try:
+                self.page.close()
+                self.page = self.context.new_page()
+            except:
+                pass
     
     def run(self, start: int = 0, limit: Optional[int] = None):
         """Запустить автоматическую проверку."""
@@ -1207,7 +1227,8 @@ class CombinedChecker:
     """Сбор диплинка + проверка в одном шаге."""
     
     def __init__(self, hotels_file: str, results_file: str, arrival_date: str, departure_date: str,
-                 adults: int = 1, children_ages: list = None, headless: bool = True, recheck: str = None):
+                 adults: int = 1, children_ages: list = None, headless: bool = True, recheck: str = None,
+                 from_csv: bool = False):
         self.hotels_file = Path(hotels_file)
         self.results_file = Path(results_file)
         self.arrival_date = arrival_date
@@ -1215,7 +1236,8 @@ class CombinedChecker:
         self.adults = adults
         self.children_ages = children_ages or []
         self.headless = headless
-        self.recheck = recheck  # None, 'guests', 'price', 'failed', 'all'
+        self.recheck = recheck  # None, 'guests', 'price', 'failed', 'all', 'deeplinks'
+        self.from_csv = from_csv  # Использовать диплинки из CSV вместо API
         
         self.token_manager = TokenManager()
         self.hotels = []
@@ -1237,7 +1259,7 @@ class CombinedChecker:
         """Загрузить уже проверенные отели из CSV."""
         recheck_count = 0
         if self.results_file.exists():
-            with open(self.results_file, 'r', encoding='utf-8') as f:
+            with open(self.results_file, 'r', encoding='utf-8', errors='replace') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     skip = False
@@ -1253,6 +1275,8 @@ class CombinedChecker:
                         elif self.recheck == 'price' and row.get('check_price_correct') == 'False':
                             skip = True
                         elif self.recheck == 'failed' and row.get('status') in ('failed', 'partial'):
+                            skip = True
+                        elif self.recheck == 'deeplinks' and row.get('deeplink', '').strip():
                             skip = True
                         elif self.recheck == 'all':
                             skip = True
@@ -1567,7 +1591,16 @@ class CombinedChecker:
         children_count = len(self.children_ages)
         
         try:
-            self.page.goto(deeplink, timeout=15000, wait_until='domcontentloaded')
+            try:
+                self.page.goto(deeplink, timeout=15000, wait_until='domcontentloaded')
+            except Exception as nav_err:
+                err_msg = str(nav_err).lower()
+                # Если навигация прервана редиректом — страница всё равно загрузилась
+                if 'interrupted' in err_msg or 'navigating' in err_msg:
+                    time.sleep(2)  # ждём завершения редиректа
+                else:
+                    raise
+            
             widget_loaded, widget_time = self.wait_for_widget(expected_date=arrival_date)
             
             page_title = self.page.title()
@@ -1601,9 +1634,22 @@ class CombinedChecker:
             }
             
         except PlaywrightTimeout:
+            self._recover_page()
             return {'status': 'failed', 'analysis': None, 'page_title': '', 'error': 'Timeout', 'widget_time': ''}
         except Exception as e:
-            return {'status': 'failed', 'analysis': None, 'page_title': '', 'error': str(e)[:100], 'widget_time': ''}
+            self._recover_page()
+            return {'status': 'failed', 'analysis': None, 'page_title': '', 'error': str(e)[:200], 'widget_time': ''}
+    
+    def _recover_page(self):
+        """Сбросить страницу после ошибки навигации."""
+        try:
+            self.page.goto('about:blank', timeout=5000)
+        except:
+            try:
+                self.page.close()
+                self.page = self.context.new_page()
+            except:
+                pass
     
     def save_result(self, hotel_id: str, hotel_name: str, deeplink: str, 
                     price: float, status: str, analysis: dict, page_title: str, error: str,
@@ -1646,7 +1692,7 @@ class CombinedChecker:
         updated = False
         
         if self.results_file.exists():
-            with open(self.results_file, 'r', newline='', encoding='utf-8') as f:
+            with open(self.results_file, 'r', newline='', encoding='utf-8', errors='replace') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     if row['hotel_id'] == hotel_id:
@@ -1668,37 +1714,54 @@ class CombinedChecker:
             writer.writeheader()
             writer.writerows(existing_rows)
     
+    def _load_deeplinks_from_csv(self) -> dict:
+        """Загрузить существующие диплинки из CSV для режима recheck=deeplinks."""
+        deeplinks = {}
+        if self.results_file.exists():
+            with open(self.results_file, 'r', encoding='utf-8', errors='replace') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    dl = (row.get('deeplink') or '').strip()
+                    if dl:
+                        deeplinks[row['hotel_id']] = {
+                            'deeplink': dl,
+                            'price': float(row['expected_price']) if row.get('expected_price') else None,
+                        }
+        return deeplinks
+    
     def run(self, start: int = 0, limit: Optional[int] = None):
         """Запустить проверку."""
         self.load_hotels()
         self.load_checked()
         
-        # Собираем непроверенные отели: пропускаем start штук, берём limit штук
-        to_check = []
-        skipped_checked = 0
-        skipped_start = 0
+        # Загружаем существующие диплинки из CSV (для --from-csv или --recheck deeplinks)
+        csv_deeplinks = {}
+        use_csv_deeplinks = self.from_csv or self.recheck == 'deeplinks'
+        if use_csv_deeplinks:
+            csv_deeplinks = self._load_deeplinks_from_csv()
+            print(f"🔗 Загружено {len(csv_deeplinks)} диплинков из CSV")
         
+        # Считаем все подходящие отели
+        eligible = []
         for i, hotel in enumerate(self.hotels):
             if hotel['id'] in self.checked_ids:
-                skipped_checked += 1
                 continue
-            
-            # Пропускаем первые start непроверенных
-            if skipped_start < start:
-                skipped_start += 1
+            if use_csv_deeplinks and hotel['id'] not in csv_deeplinks:
                 continue
-            
-            to_check.append((i, hotel))
-            if limit is not None and len(to_check) >= limit:
-                break
+            eligible.append((i, hotel))
+        
+        # Применяем start и limit
+        skipped_start = min(start, len(eligible))
+        end = len(eligible) if limit is None else min(skipped_start + limit, len(eligible))
+        to_check = eligible[skipped_start:end]
         
         if not to_check:
             print("✅ Все отели уже проверены")
             return
         
-        total_unchecked = len(self.hotels) - len(self.checked_ids)
-        print(f"\n🚀 Проверка: {len(to_check)} отелей (всего непроверенных: {total_unchecked}, пропущено по --start: {skipped_start})")
-        print(f"📅 Даты: {self.arrival_date} - {self.departure_date}")
+        print(f"\n🚀 Проверка: {len(to_check)} отелей (всего к проверке: {len(eligible)}, пропущено по --start: {skipped_start})")
+        if not use_csv_deeplinks:
+            print(f"📅 Даты: {self.arrival_date} - {self.departure_date}")
         print(f"👥 Гости: {self.adults} взр." + (f" + дети {self.children_ages}" if self.children_ages else ""))
         print("-" * 50)
         
@@ -1713,21 +1776,34 @@ class CombinedChecker:
                 
                 print(f"[{idx + 1}/{len(to_check)}] {hotel_name[:30]}...", end=' ')
                 
-                # 1. Получаем диплинк
-                deeplink, price, arrival, departure = self.get_deeplink(hotel_id)
-                time.sleep(0.5)  # Rate limit prevention
-                
-                if deeplink == 'no_access':
-                    print("🚫 нет доступа")
-                    self.save_result(hotel_id, hotel_name, '', None, 'no_access', None, '', 'API access denied')
-                    stats['no_access'] += 1
-                    continue
-                
-                if not deeplink:
-                    print("📭 нет комнат")
-                    self.save_result(hotel_id, hotel_name, '', None, 'no_rooms', None, '', 'No rooms available')
-                    stats['no_rooms'] += 1
-                    continue
+                # Режим CSV — берём диплинк из CSV, без API
+                if use_csv_deeplinks and hotel_id in csv_deeplinks:
+                    dl_info = csv_deeplinks[hotel_id]
+                    deeplink = dl_info['deeplink']
+                    price = dl_info['price']
+                    # Извлекаем дату из диплинка
+                    try:
+                        from urllib.parse import urlparse, parse_qs
+                        parsed = parse_qs(urlparse(deeplink).query)
+                        arrival = parsed.get('tl-date', [self.arrival_date])[0]
+                    except:
+                        arrival = self.arrival_date
+                else:
+                    # Стандартный режим — получаем диплинк из API
+                    deeplink, price, arrival, departure = self.get_deeplink(hotel_id)
+                    time.sleep(0.5)  # Rate limit prevention
+                    
+                    if deeplink == 'no_access':
+                        print("🚫 нет доступа")
+                        self.save_result(hotel_id, hotel_name, '', None, 'no_access', None, '', 'API access denied')
+                        stats['no_access'] += 1
+                        continue
+                    
+                    if not deeplink:
+                        print("📭 нет комнат")
+                        self.save_result(hotel_id, hotel_name, '', None, 'no_rooms', None, '', 'No rooms available')
+                        stats['no_rooms'] += 1
+                        continue
                 
                 # 2. Проверяем страницу
                 result = self.check_hotel(hotel_id, hotel_name, deeplink, price, arrival)
@@ -1791,7 +1867,8 @@ def cmd_check(args):
         adults=args.adults,
         children_ages=children_ages,
         headless=not args.gui,
-        recheck=getattr(args, 'recheck', None)
+        recheck=getattr(args, 'recheck', None),
+        from_csv=getattr(args, 'from_csv', False)
     )
     
     checker.run(start=args.start, limit=args.limit)
@@ -1873,7 +1950,7 @@ def cmd_next(args):
     results_file = Path(args.results)
     checked_ids = set()
     if results_file.exists():
-        with open(results_file, 'r', encoding='utf-8') as f:
+        with open(results_file, 'r', encoding='utf-8', errors='replace') as f:
             reader = csv.DictReader(f)
             checked_ids = {row['hotel_id'] for row in reader}
     
@@ -1973,7 +2050,7 @@ def cmd_report(args):
         print("❌ Файл результатов не найден")
         return
     
-    with open(results_file, 'r', encoding='utf-8') as f:
+    with open(results_file, 'r', encoding='utf-8', errors='replace') as f:
         reader = csv.DictReader(f)
         rows = list(reader)
     
@@ -2074,8 +2151,10 @@ def main():
     check_parser.add_argument('--hotels', type=str, default='hotels_id_name.json', help='Файл с отелями')
     check_parser.add_argument('--output', type=str, default='deeplink_results.csv', help='Выходной CSV')
     check_parser.add_argument('--gui', action='store_true', help='Показать окно браузера')
-    check_parser.add_argument('--recheck', type=str, choices=['guests', 'price', 'failed', 'all'],
-                              help='Перепроверить: guests/price/failed/all')
+    check_parser.add_argument('--recheck', type=str, choices=['guests', 'price', 'failed', 'all', 'deeplinks'],
+                              help='Перепроверить: guests/price/failed/all/deeplinks')
+    check_parser.add_argument('--from-csv', action='store_true',
+                              help='Использовать диплинки из CSV вместо API (комбинируется с --recheck)')
     
     args = parser.parse_args()
     
