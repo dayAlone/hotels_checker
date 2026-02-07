@@ -104,7 +104,8 @@ class PageAnalyzer:
     def analyze(snapshot: str, page_title: str, hotel_name: str, expected_date: str,
                 adults: int = 1, children_count: int = 0, deeplink: str = '',
                 expected_price: float = None, children_ages: list = None,
-                guests_dropdown_text: str = '') -> dict:
+                guests_dropdown_text: str = '',
+                is_ibe_deeplink: bool = False) -> dict:
         """
         Анализ страницы по критериям.
         
@@ -171,17 +172,22 @@ class PageAnalyzer:
         name_in_title = hotel_name_clean in title_lower or any(w in title_lower for w in hotel_name_words if len(w) > 3)
         name_in_content = hotel_name_clean in snapshot_lower or any(w in snapshot_lower for w in hotel_name_words if len(w) > 3)
         
-        results['name_matches'] = name_in_widget or name_in_title or name_in_content
-        if not results['name_matches']:
-            errors.append(f'Название отеля не найдено: {hotel_name}')
-        
         # 3. Есть виджет TravelLine (iframe с booking или travelline)
-        has_iframe = 'iframe' in snapshot_lower
-        has_booking_context = 'booking' in snapshot_lower or 'бронирован' in snapshot_lower
-        has_travelline = 'travelline' in snapshot_lower or 'tl-' in snapshot_lower
-        results['has_travelline'] = has_iframe and (has_booking_context or has_travelline)
-        if not results['has_travelline']:
-            errors.append('Виджет TravelLine не найден')
+        if is_ibe_deeplink:
+            # Для прямых IBE-ссылок мы уже на странице TL виджета
+            results['has_travelline'] = True
+            results['name_matches'] = True
+        else:
+            results['name_matches'] = name_in_widget or name_in_title or name_in_content
+            if not results['name_matches']:
+                errors.append(f'Название отеля не найдено: {hotel_name}')
+            
+            has_iframe = 'iframe' in snapshot_lower
+            has_booking_context = 'booking' in snapshot_lower or 'бронирован' in snapshot_lower
+            has_travelline = 'travelline' in snapshot_lower or 'tl-' in snapshot_lower
+            results['has_travelline'] = has_iframe and (has_booking_context or has_travelline)
+            if not results['has_travelline']:
+                errors.append('Виджет TravelLine не найден')
         
         # 4. Нет сообщений об ошибках (проверяем строгие паттерны)
         # Используем только видимый текст (без HTML/JS), чтобы исключить ложные срабатывания
@@ -262,9 +268,13 @@ class PageAnalyzer:
             results['guests_correct'] = True
             results['guests_info'] = 'no_children_in_deeplink'
         elif not has_any_guest_info:
-            # Виджет не загрузился или текст недоступен — не фейлим проверку
             results['guests_correct'] = True
-            results['guests_info'] = 'not_available'
+            if results['has_travelline']:
+                # Виджет загружен, но нет текста про гостей — нет поля ввода
+                results['guests_info'] = 'no_guest_input'
+            else:
+                # Виджет не найден — проверить невозможно
+                results['guests_info'] = 'not_available'
         else:
             # Паттерны для взрослых
             if adults == 1:
@@ -342,8 +352,10 @@ class PageAnalyzer:
             parsed_url = urlparse(deeplink)
             query_params = parse_qs(parsed_url.query)
             
-            # tl-children-age может быть несколько раз в URL
-            url_ages = sorted([int(a) for a in query_params.get('tl-children-age', [])])
+            # tl-children-age (стандартный диплинк) или childrenAges (IBE диплинк)
+            tl_ages = query_params.get('tl-children-age', [])
+            ibe_ages = query_params.get('childrenAges', [])
+            url_ages = sorted([int(a) for a in (tl_ages or ibe_ages)])
             expected_ages = sorted(children_ages)
             
             results['children_ages_in_url'] = url_ages == expected_ages
@@ -580,17 +592,136 @@ class DeeplinkCollector:
         
         return {'error': 429}
     
+    # ── TL IBE API fallback ──────────────────────────────────────────────
+    IBE_BASE = 'https://ru-ibe.tlintegration.ru/ApiWebDistribution'
+
+    def _ibe_api_fallback(self, hotel_id: str) -> Optional[tuple[str, float, str, str]]:
+        """Fallback через TL IBE API для отелей, не подключённых к Partner API."""
+        try:
+            from datetime import datetime as dt
+            today = dt.now().strftime('%Y-%m-%d')
+            tomorrow = (dt.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+            ibe_headers = {'Accept': 'application/json',
+                          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'}
+            
+            # 1. Ближайшие даты через IBE
+            r = requests.get(
+                f"{self.IBE_BASE}/AvailabilityCalendar/nearest_available_dates",
+                params={'hotel': hotel_id, 'start_date': today, 'end_date': tomorrow,
+                        'prefer_exact_dates': 'false', 'shared': 'false'},
+                headers=ibe_headers, timeout=10
+            )
+            if r.status_code != 200:
+                return None
+            stay_dates = r.json().get('stay_dates', [])
+            if not stay_dates:
+                return None
+            
+            start = stay_dates[0]['start_date']
+            end = stay_dates[0]['end_date']
+            d_start = dt.strptime(start, '%Y-%m-%d')
+            d_end = dt.strptime(end, '%Y-%m-%d')
+            min_nights = (d_end - d_start).days  # минимальный срок проживания
+            
+            # Варианты: точные даты IBE (уважают min stay), затем +1/+2 ночи
+            date_variants = [(start, end)]
+            for extra in [1, 2]:
+                longer_end = (d_end + timedelta(days=extra)).strftime('%Y-%m-%d')
+                date_variants.append((start, longer_end))
+            
+            print(f"📅 IBE {start}→{end} ({min_nights}н)", end=' ')
+            
+            # 2. Быстрая проверка: есть ли реально номера в IBE?
+            ibe_has_rooms = False
+            ibe_working_variant = None  # (s, e, with_children, price)
+            for with_ch in ([True, False] if self.children_ages else [True]):
+                for s, e in date_variants:
+                    params = {
+                        'include_all_placements': 'false',
+                        'include_promo_restricted': 'true',
+                        'include_rates': 'true',
+                        'include_transfers': 'true',
+                        'language': 'ru-ru',
+                        'criterions[0].adults': self.adults,
+                        'criterions[0].dates': f'{s};{e}',
+                        'criterions[0].hotels[0].code': hotel_id,
+                    }
+                    if with_ch and self.children_ages:
+                        for i, age in enumerate(self.children_ages):
+                            params[f'criterions[0].children_ages[{i}]'] = age
+                    
+                    r2 = requests.get(f"{self.IBE_BASE}/BookingForm/hotel_availability",
+                                      params=params, headers=ibe_headers, timeout=15)
+                    if r2.status_code == 200:
+                        room_stays = r2.json().get('room_stays', [])
+                        if room_stays:
+                            rs = room_stays[0]
+                            ibe_price = rs.get('total', {}).get('price_after_tax')
+                            ibe_has_rooms = True
+                            ibe_working_variant = (s, e, with_ch, ibe_price)
+                            break
+                if ibe_has_rooms:
+                    break
+            
+            if not ibe_has_rooms:
+                # Подстраховка: 1 запрос к Partner API с точными IBE-датами
+                room_data = self.get_room_stays_with_dates(hotel_id, start, end, with_children=bool(self.children_ages))
+                if 'error' not in room_data:
+                    deeplink, price, currency = self.extract_deeplink(room_data)
+                    if deeplink:
+                        print(f"✅ Partner (IBE дат): {price} {currency}")
+                        return (deeplink, price, start, end)
+                return None
+            
+            # 3. Номера есть в IBE → пробуем Partner API (диплинк на сайт отеля)
+            wv_s, wv_e, wv_ch, wv_price = ibe_working_variant
+            for with_ch in ([True, False] if self.children_ages else [True]):
+                for s, e in date_variants:
+                    room_data = self.get_room_stays_with_dates(hotel_id, s, e, with_children=with_ch)
+                    if 'error' not in room_data:
+                        deeplink, price, currency = self.extract_deeplink(room_data)
+                        if deeplink:
+                            suffix = "" if with_ch else " (без детей)"
+                            print(f"✅ Partner{suffix}: {price} {currency}")
+                            return (deeplink, price, s, e)
+            
+            # 4. Partner API не помог — IBE диплинк
+            deeplink = (
+                f"https://ru-ibe.tlintegration.ru/booking2/hotel/index.gc.html"
+                f"?providerId={hotel_id}&language=ru&currency=RUB"
+                f"&adults={self.adults}&arrivalDate={wv_s}&departureDate={wv_e}"
+            )
+            if wv_ch and self.children_ages:
+                for age in self.children_ages:
+                    deeplink += f"&childrenAges={age}"
+            suffix = "" if wv_ch else " (без детей)"
+            print(f"✅ IBE{suffix}: {wv_price}₽")
+            return (deeplink, wv_price, wv_s, wv_e)
+        except Exception as ex:
+            print(f"❌ IBE ошибка: {ex}")
+        return None
+
     def try_fallback_dates(self, hotel_id: str, with_children: bool = True) -> tuple[Optional[dict], str, str]:
         """Попробовать альтернативные даты если нет комнат."""
         fallback_dates = [
+            ('2026-02-15', '2026-02-16', 'фев 1н'),
+            ('2026-02-15', '2026-02-19', 'фев 4н'),
             ('2026-03-01', '2026-03-02', 'март 1н'),
             ('2026-03-01', '2026-03-05', 'март 4н'),
             ('2026-04-01', '2026-04-02', 'апрель 1н'),
             ('2026-04-01', '2026-04-05', 'апрель 4н'),
             ('2026-05-01', '2026-05-02', 'май 1н'),
             ('2026-05-01', '2026-05-05', 'май 4н'),
+            ('2026-06-15', '2026-06-16', 'июнь 1н'),
+            ('2026-06-15', '2026-06-19', 'июнь 4н'),
+            ('2026-07-15', '2026-07-16', 'июль 1н'),
+            ('2026-07-15', '2026-07-19', 'июль 4н'),
+            ('2026-09-01', '2026-09-02', 'сент 1н'),
+            ('2026-09-01', '2026-09-05', 'сент 4н'),
             ('2026-10-01', '2026-10-02', 'октябрь 1н'),
             ('2026-10-01', '2026-10-05', 'октябрь 4н'),
+            ('2026-11-15', '2026-11-16', 'ноябрь 1н'),
+            ('2026-12-15', '2026-12-16', 'декабрь 1н'),
         ]
         
         for arrival, departure, period_name in fallback_dates:
@@ -702,6 +833,21 @@ class DeeplinkCollector:
                             used_arrival = fb_arr
                             used_departure = fb_dep
                 
+                # IBE fallback: если Partner API не помог
+                ibe_only = False
+                if not deeplink:
+                    print("🔄 IBE fallback...", end=' ')
+                    ibe_result = self._ibe_api_fallback(hotel_id)
+                    if ibe_result and ibe_result[0]:
+                        deeplink = ibe_result[0]
+                        price = ibe_result[1]
+                        currency = 'RUB'
+                        used_arrival = ibe_result[2]
+                        used_departure = ibe_result[3]
+                        # Если диплинк ведёт на виджет TL — пометить как ibe_only
+                        if 'tlintegration.ru/booking2' in deeplink:
+                            ibe_only = True
+                
                 if not deeplink:
                     print("📭 нет комнат")
                     results.append({
@@ -715,7 +861,9 @@ class DeeplinkCollector:
                     })
                 else:
                     date_info = f" [{used_arrival}]" if used_arrival != self.arrival_date else ""
-                    print(f"✅ диплинк получен ({price} {currency}){date_info}")
+                    api_st = 'ibe_only' if ibe_only else 'ok'
+                    label = "🔶 IBE-only" if ibe_only else "✅ диплинк получен"
+                    print(f"{label} ({price} {currency}){date_info}")
                     results.append({
                         'hotel_id': hotel_id,
                         'hotel_name': hotel_name,
@@ -724,7 +872,7 @@ class DeeplinkCollector:
                         'currency': currency,
                         'arrival_date': used_arrival,
                         'departure_date': used_departure,
-                        'api_status': 'ok',
+                        'api_status': api_st,
                         'collected_at': datetime.now().isoformat()
                     })
         except KeyboardInterrupt:
@@ -1049,7 +1197,52 @@ class BrowserChecker:
             except:
                 pass
         
+        # Если мы уже на странице TL IBE (прямой виджет), используем main_frame
+        try:
+            current_url = self.page.url.lower()
+            if 'tlintegration' in current_url and 'booking' in current_url:
+                return ('frame', main_frame)
+        except:
+            pass
+        
         return (None, None)
+    
+    def _read_frame_text(self, frame_type, frame, max_wait: int = 10) -> str:
+        """Прочитать текст из TL iframe с ретраем при пустом контенте.
+        
+        IBE виджеты могут загружаться медленно — body.inner_text() пуст,
+        хотя input-поля уже заполнены. Поллим до max_wait секунд.
+        """
+        GUEST_MARKERS = ['взрослый', 'взрослых', 'гостя', 'гостей', 'номер', 'размещение']
+        
+        try:
+            if frame_type == 'frame':
+                text = frame.locator('body').inner_text(timeout=3000)
+            else:
+                text = frame.locator('body').inner_text(timeout=3000)
+        except:
+            return ''
+        
+        # Если текст достаточный (есть слова про гостей или > 100 символов) — возвращаем
+        text_lower = text.lower()
+        if len(text.strip()) > 100 or any(m in text_lower for m in GUEST_MARKERS):
+            return text
+        
+        # Иначе поллим: IBE виджет ещё рендерится
+        for _ in range(max_wait):
+            time.sleep(1)
+            try:
+                if frame_type == 'frame':
+                    text = frame.locator('body').inner_text(timeout=3000)
+                else:
+                    text = frame.locator('body').inner_text(timeout=3000)
+                text_lower = text.lower()
+                if len(text.strip()) > 100 or any(m in text_lower for m in GUEST_MARKERS):
+                    return text
+            except:
+                pass
+        
+        return text
     
     def get_page_text(self) -> str:
         """Получить текстовое содержимое страницы для анализа."""
@@ -1064,7 +1257,7 @@ class BrowserChecker:
             
             if frame_type == 'frame':
                 try:
-                    text = frame.locator('body').inner_text(timeout=3000)
+                    text = self._read_frame_text(frame_type, frame)
                     parts.append(text)
                     inputs = frame.query_selector_all('input')
                     for inp in inputs:
@@ -1075,7 +1268,7 @@ class BrowserChecker:
                     pass
             elif frame_type == 'locator':
                 try:
-                    text = frame.locator('body').inner_text(timeout=3000)
+                    text = self._read_frame_text(frame_type, frame)
                     parts.append(text)
                     inp_count = frame.locator('input').count()
                     for i in range(inp_count):
@@ -1516,10 +1709,6 @@ class CombinedChecker:
                 for row in reader:
                     skip = False
                     
-                    # Всегда перепроверяем no_rooms (кроме --recheck failed)
-                    if row.get('status') == 'no_rooms' and self.recheck != 'failed':
-                        skip = True
-                    
                     # Перепроверка по флагу --recheck
                     if self.recheck:
                         if self.recheck == 'guests' and row.get('check_guests_correct') == 'False':
@@ -1532,9 +1721,13 @@ class CombinedChecker:
                             skip = True
                         elif self.recheck == 'deeplinks' and (row.get('deeplink') or '').strip():
                             skip = True
+                        elif self.recheck == 'guests-na' and row.get('guests_info') == 'not_available':
+                            skip = True
                         elif self.recheck == 'children' and row.get('children_selectable') in ('False', '') and row.get('guests_info') in ('children_as_adults', 'mismatch', 'not_available', 'no_children_in_deeplink'):
                             skip = True
                         elif self.recheck == 'children' and row.get('children_selectable') == 'True' and not row.get('children_ages_on_page'):
+                            skip = True
+                        elif self.recheck == 'no_rooms' and row.get('status') == 'no_rooms':
                             skip = True
                         elif self.recheck == 'all':
                             skip = True
@@ -1581,14 +1774,24 @@ class CombinedChecker:
         API_BASE = 'https://partner.tlintegration.com/api/search'
         
         fallback_dates = [
+            ('2026-02-15', '2026-02-16'),
+            ('2026-02-15', '2026-02-19'),
             ('2026-03-01', '2026-03-02'),
             ('2026-03-01', '2026-03-05'),
             ('2026-04-01', '2026-04-02'),
             ('2026-04-01', '2026-04-05'),
             ('2026-05-01', '2026-05-02'),
             ('2026-05-01', '2026-05-05'),
+            ('2026-06-15', '2026-06-16'),
+            ('2026-06-15', '2026-06-19'),
+            ('2026-07-15', '2026-07-16'),
+            ('2026-07-15', '2026-07-19'),
+            ('2026-09-01', '2026-09-02'),
+            ('2026-09-01', '2026-09-05'),
             ('2026-10-01', '2026-10-02'),
             ('2026-10-01', '2026-10-05'),
+            ('2026-11-15', '2026-11-16'),
+            ('2026-12-15', '2026-12-16'),
         ]
         
         # 1. С детьми: основная дата
@@ -1615,8 +1818,160 @@ class CombinedChecker:
                 if result[0]:
                     return result
         
+        # 4. Fallback: TL IBE API (Booking Engine) — для отелей, не подключённых к Partner API
+        ibe_result = self._ibe_api_fallback(hotel_id)
+        if ibe_result[0]:
+            return ibe_result
+        
         return None, None, self.arrival_date, self.departure_date
     
+    # ── TL IBE API fallback ──────────────────────────────────────────────
+    IBE_BASE = 'https://ru-ibe.tlintegration.ru/ApiWebDistribution'
+
+    def _ibe_nearest_dates(self, hotel_id: str) -> Optional[dict]:
+        """Получить ближайшие доступные даты через TL IBE API."""
+        try:
+            from datetime import datetime
+            today = datetime.now().strftime('%Y-%m-%d')
+            tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+            r = requests.get(
+                f"{self.IBE_BASE}/AvailabilityCalendar/nearest_available_dates",
+                params={
+                    'hotel': hotel_id,
+                    'start_date': today,
+                    'end_date': tomorrow,
+                    'prefer_exact_dates': 'false',
+                    'shared': 'false'
+                },
+                headers={'Accept': 'application/json',
+                         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'},
+                timeout=10
+            )
+            if r.status_code == 200:
+                data = r.json()
+                stay_dates = data.get('stay_dates', [])
+                if stay_dates:
+                    return stay_dates[0]  # {'start_date': '...', 'end_date': '...'}
+        except Exception:
+            pass
+        return None
+
+    def _ibe_get_rooms(self, hotel_id: str, start_date: str, end_date: str,
+                       with_children: bool = True) -> Optional[tuple[str, float, str, str]]:
+        """Получить комнаты через TL IBE hotel_availability и собрать диплинк."""
+        try:
+            params = {
+                'include_all_placements': 'false',
+                'include_promo_restricted': 'true',
+                'include_rates': 'true',
+                'include_transfers': 'true',
+                'language': 'ru-ru',
+                'criterions[0].adults': self.adults,
+                'criterions[0].dates': f'{start_date};{end_date}',
+                'criterions[0].hotels[0].code': hotel_id,
+            }
+            if with_children and self.children_ages:
+                for i, age in enumerate(self.children_ages):
+                    params[f'criterions[0].children_ages[{i}]'] = age
+
+            r = requests.get(
+                f"{self.IBE_BASE}/BookingForm/hotel_availability",
+                params=params,
+                headers={'Accept': 'application/json',
+                         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'},
+                timeout=15
+            )
+            if r.status_code == 200:
+                data = r.json()
+                room_stays = data.get('room_stays', [])
+                if room_stays:
+                    rs = room_stays[0]
+                    price = rs.get('total', {}).get('price_after_tax')
+                    
+                    # Собираем диплинк через прямой URL TL IBE
+                    deeplink = (
+                        f"https://ru-ibe.tlintegration.ru/booking2/hotel/index.gc.html"
+                        f"?providerId={hotel_id}"
+                        f"&language=ru&currency=RUB"
+                        f"&adults={self.adults}"
+                        f"&arrivalDate={start_date}"
+                        f"&departureDate={end_date}"
+                    )
+                    if with_children and self.children_ages:
+                        for age in self.children_ages:
+                            deeplink += f"&childrenAges={age}"
+                    
+                    return deeplink, price, start_date, end_date
+        except Exception:
+            pass
+        return None
+
+    def _ibe_api_fallback(self, hotel_id: str) -> tuple[Optional[str], Optional[float], str, str]:
+        """Fallback через TL IBE API для отелей, не подключённых к Partner API."""
+        print("🔄 IBE даты...", end=' ')
+        
+        dates = self._ibe_nearest_dates(hotel_id)
+        if not dates:
+            return None, None, self.arrival_date, self.departure_date
+        
+        start = dates['start_date']
+        end = dates['end_date']
+        d_start = datetime.strptime(start, '%Y-%m-%d')
+        d_end = datetime.strptime(end, '%Y-%m-%d')
+        min_nights = (d_end - d_start).days  # минимальный срок проживания
+        
+        # Варианты: точные даты IBE (уважают min stay), затем +1/+2 ночи
+        date_variants = [(start, end)]
+        for extra in [1, 2]:
+            longer_end = (d_end + timedelta(days=extra)).strftime('%Y-%m-%d')
+            date_variants.append((start, longer_end))
+        
+        print(f"📅 {start}→{end} ({min_nights}н)", end=' ')
+        
+        # 1. Быстрая проверка: есть ли реально номера в IBE?
+        ibe_working = None  # (s, e, with_children, price)
+        for with_ch in ([True, False] if self.children_ages else [True]):
+            for s, e in date_variants:
+                result = self._ibe_get_rooms(hotel_id, s, e, with_children=with_ch)
+                if result:
+                    ibe_working = (s, e, with_ch, result[1])
+                    break
+            if ibe_working:
+                break
+        
+        if not ibe_working:
+            # Подстраховка: 1 запрос к Partner API с точными IBE-датами
+            API_BASE = 'https://partner.tlintegration.com/api/search'
+            result = self._api_request(API_BASE, hotel_id, start, end)
+            if result[0] and result[0] != 'no_access':
+                print(f"✅ Partner (IBE дат): {result[1]}₽")
+                return result
+            return None, None, self.arrival_date, self.departure_date
+        
+        # 2. Номера есть в IBE → пробуем Partner API (диплинк на сайт отеля)
+        API_BASE = 'https://partner.tlintegration.com/api/search'
+        for s, e in date_variants:
+            result = self._api_request(API_BASE, hotel_id, s, e)
+            if result[0] and result[0] != 'no_access':
+                print(f"✅ Partner API: {result[1]}₽")
+                return result
+        if self.children_ages:
+            for s, e in date_variants:
+                result = self._api_request(API_BASE, hotel_id, s, e, with_children=False)
+                if result[0] and result[0] != 'no_access':
+                    print(f"✅ Partner API (без детей): {result[1]}₽")
+                    return result
+        
+        # 3. Partner API не помог — IBE диплинк
+        wv_s, wv_e, wv_ch, wv_price = ibe_working
+        result = self._ibe_get_rooms(hotel_id, wv_s, wv_e, with_children=wv_ch)
+        if result:
+            suffix = "" if wv_ch else " (без детей)"
+            print(f"✅ IBE{suffix}: {result[1]}₽")
+            return result
+        
+        return None, None, self.arrival_date, self.departure_date
+
     def _api_request(self, api_base: str, hotel_id: str, arrival: str, departure: str, 
                      max_retries: int = 3, with_children: bool = True) -> tuple[Optional[str], Optional[float], str, str]:
         """Запрос к API с retry."""
@@ -1802,7 +2157,52 @@ class CombinedChecker:
             except:
                 pass
         
+        # Если мы уже на странице TL IBE (прямой виджет), используем main_frame
+        try:
+            current_url = self.page.url.lower()
+            if 'tlintegration' in current_url and 'booking' in current_url:
+                return ('frame', main_frame)
+        except:
+            pass
+        
         return (None, None)
+    
+    def _read_frame_text(self, frame_type, frame, max_wait: int = 10) -> str:
+        """Прочитать текст из TL iframe с ретраем при пустом контенте.
+        
+        IBE виджеты могут загружаться медленно — body.inner_text() пуст,
+        хотя input-поля уже заполнены. Поллим до max_wait секунд.
+        """
+        GUEST_MARKERS = ['взрослый', 'взрослых', 'гостя', 'гостей', 'номер', 'размещение']
+        
+        try:
+            if frame_type == 'frame':
+                text = frame.locator('body').inner_text(timeout=3000)
+            else:
+                text = frame.locator('body').inner_text(timeout=3000)
+        except:
+            return ''
+        
+        # Если текст достаточный (есть слова про гостей или > 100 символов) — возвращаем
+        text_lower = text.lower()
+        if len(text.strip()) > 100 or any(m in text_lower for m in GUEST_MARKERS):
+            return text
+        
+        # Иначе поллим: IBE виджет ещё рендерится
+        for _ in range(max_wait):
+            time.sleep(1)
+            try:
+                if frame_type == 'frame':
+                    text = frame.locator('body').inner_text(timeout=3000)
+                else:
+                    text = frame.locator('body').inner_text(timeout=3000)
+                text_lower = text.lower()
+                if len(text.strip()) > 100 or any(m in text_lower for m in GUEST_MARKERS):
+                    return text
+            except:
+                pass
+        
+        return text
     
     def get_page_text(self) -> str:
         """Получить текст страницы включая iframe."""
@@ -1813,7 +2213,7 @@ class CombinedChecker:
             
             if frame_type == 'frame':
                 try:
-                    text = frame.locator('body').inner_text(timeout=3000)
+                    text = self._read_frame_text(frame_type, frame)
                     parts.append(text)
                     inputs = frame.query_selector_all('input')
                     for inp in inputs:
@@ -1824,7 +2224,7 @@ class CombinedChecker:
                     pass
             elif frame_type == 'locator':
                 try:
-                    text = frame.locator('body').inner_text(timeout=3000)
+                    text = self._read_frame_text(frame_type, frame)
                     parts.append(text)
                     inp_count = frame.locator('input').count()
                     for i in range(inp_count):
@@ -1982,6 +2382,18 @@ class CombinedChecker:
             # Закрываем оверлеи (cookie-баннеры, accept-диалоги) перед ожиданием виджета
             self._dismiss_overlays()
             
+            # Для прямых IBE-ссылок: нужно нажать "Найти" чтобы виджет показал номера
+            is_ibe_direct = 'tlintegration.ru/booking2' in deeplink
+            if is_ibe_direct:
+                try:
+                    time.sleep(2)
+                    btn = self.page.locator('button:has-text("Найти"), button:has-text("НАЙТИ")')
+                    if btn.count() > 0:
+                        btn.first.click()
+                        time.sleep(5)
+                except:
+                    pass
+            
             widget_loaded, _wt = self.wait_for_widget(expected_date=arrival_date)
             # Общее время = навигация + dismiss + wait_for_widget
             total_time = round(time.time() - check_start, 1)
@@ -2011,7 +2423,8 @@ class CombinedChecker:
                 deeplink=deeplink,
                 expected_price=price,
                 children_ages=self.children_ages,
-                guests_dropdown_text=guests_detail
+                guests_dropdown_text=guests_detail,
+                is_ibe_deeplink=is_ibe_direct
             )
             
             status = PageAnalyzer.get_status(analysis)
@@ -2272,8 +2685,14 @@ class CombinedChecker:
                     except:
                         arrival = self.arrival_date
                 else:
-                    # Стандартный режим — получаем диплинк из API
-                    deeplink, price, arrival, departure = self.get_deeplink(hotel_id)
+                    # Для --recheck no_rooms: сразу IBE (стандартные даты уже проверялись)
+                    if self.recheck == 'no_rooms':
+                        deeplink, price, arrival, departure = self._ibe_api_fallback(hotel_id)
+                        if not deeplink:
+                            deeplink = None
+                    else:
+                        # Стандартный режим — получаем диплинк из API
+                        deeplink, price, arrival, departure = self.get_deeplink(hotel_id)
                     time.sleep(0.5)  # Rate limit prevention
                     
                     if deeplink == 'no_access':
@@ -2286,6 +2705,14 @@ class CombinedChecker:
                         print("📭 нет комнат")
                         self.save_result(hotel_id, hotel_name, '', None, 'no_rooms', None, '', 'No rooms available')
                         stats['no_rooms'] += 1
+                        continue
+                    
+                    # IBE-only: диплинк ведёт на виджет TL, а не на сайт отеля
+                    if 'tlintegration.ru/booking2' in deeplink:
+                        print(f"🔶 IBE-only ({price}₽) [{arrival}]")
+                        self.save_result(hotel_id, hotel_name, deeplink, price, 'ibe_only', None, '',
+                                         'Отель не в Partner API, диплинк через TL IBE')
+                        stats['ibe_only'] = stats.get('ibe_only', 0) + 1
                         continue
                 
                 # 2. Проверяем страницу
@@ -2326,6 +2753,8 @@ class CombinedChecker:
         print(f"   ❌ Ошибки: {stats['failed']}")
         print(f"   🚫 Нет доступа: {stats['no_access']}")
         print(f"   📭 Нет комнат: {stats['no_rooms']}")
+        if stats.get('ibe_only'):
+            print(f"   🔶 IBE-only: {stats['ibe_only']}")
         print(f"\n💾 Результаты: {self.results_file}")
 
 
@@ -2591,6 +3020,150 @@ def cmd_report(args):
             print(f"   ... и ещё {len(problems) - 10}")
 
 
+def cmd_summary(args):
+    """Подробное саммари по CSV файлу результатов."""
+    results_file = Path(args.results)
+    if not results_file.exists():
+        print(f"❌ Файл не найден: {results_file}")
+        return
+    
+    with open(results_file, 'r', encoding='utf-8', errors='replace') as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    
+    if not rows:
+        print("❌ Файл пуст")
+        return
+    
+    total = len(rows)
+    
+    # --- 1. Общая статистика ---
+    success = [r for r in rows if r.get('status') == 'success']
+    partial = [r for r in rows if r.get('status') == 'partial']
+    failed = [r for r in rows if r.get('status') == 'failed']
+    no_rooms = [r for r in rows if r.get('status') == 'no_rooms']
+    no_access = [r for r in rows if r.get('status') == 'no_access']
+    api_error = [r for r in rows if r.get('status') == 'api_error']
+    
+    # Отели, прошедшие проверку сайта (есть виджет, страница загрузилась)
+    checked_on_site = [r for r in rows if r.get('status') in ('success', 'partial')]
+    
+    print(f"\n{'='*60}")
+    print(f"  📊 Саммари проверки диплинков")
+    print(f"  Файл: {results_file}")
+    print(f"{'='*60}")
+    
+    # --- 1. Всего проверено ---
+    print(f"\n📋 1. Всего отелей: {total}")
+    print(f"   Проверено на сайте: {len(checked_on_site)}")
+    if no_rooms:
+        print(f"   Нет комнат (не проверялись на сайте): {len(no_rooms)}")
+    if no_access:
+        print(f"   Нет доступа к API: {len(no_access)}")
+    if api_error:
+        print(f"   Ошибка API: {len(api_error)}")
+    
+    # --- 2. Успешно прошли ---
+    print(f"\n✅ 2. Успешно прошли все проверки: {len(success)} из {total} ({len(success)*100/total:.2f}%)")
+    
+    # --- 3. Только цена не совпала ---
+    price_wrong_total = [r for r in checked_on_site if r.get('check_price_correct') == 'False']
+    only_price_mismatch = [r for r in price_wrong_total if
+        r.get('check_name_matches') == 'True' and
+        r.get('check_has_travelline') == 'True' and
+        r.get('check_no_errors') == 'True' and
+        r.get('check_dates_correct') == 'True' and
+        r.get('check_guests_correct') == 'True'
+    ]
+    price_and_dates = [r for r in price_wrong_total if r.get('check_dates_correct') == 'False']
+    price_other = len(price_wrong_total) - len(only_price_mismatch) - len(price_and_dates)
+    
+    print(f"\n💰 3. Несовпадение цены: {len(price_wrong_total)}")
+    print(f"   Только цена (остальное ОК): {len(only_price_mismatch)}")
+    print(f"   Цена + даты не совпали: {len(price_and_dates)}")
+    if price_other > 0:
+        print(f"   Цена + другие проблемы: {price_other}")
+    
+    # --- 4. Работа с гостями ---
+    from collections import Counter
+    
+    # Только отели с найденным виджетом TL — без виджета проверять гостей не в чем
+    with_widget = [r for r in checked_on_site if r.get('check_has_travelline') == 'True']
+    
+    # Нормализуем guests_info:
+    #   пустое значение при check_guests_correct=True → correct
+    #   not_available при has_travelline=True → no_guest_input (виджет есть, поля гостей нет)
+    guests_info_normalized = []
+    for r in with_widget:
+        gi = r.get('guests_info', '')
+        if not gi and r.get('check_guests_correct') == 'True':
+            gi = 'correct'
+        elif gi == 'not_available':
+            gi = 'no_guest_input'
+        guests_info_normalized.append(gi)
+    guests_counter = Counter(guests_info_normalized)
+    
+    # children_selectable
+    selectable_true = sum(1 for r in with_widget if r.get('children_selectable') == 'True')
+    selectable_false = sum(1 for r in with_widget if r.get('children_selectable') == 'False')
+    selectable_unknown = len(with_widget) - selectable_true - selectable_false
+    
+    guests_labels = {
+        '': 'не определено (нет данных)',
+        'correct': 'гости отображаются корректно ✅',
+        'children_as_adults': 'дети считаются как взрослые ⚠️',
+        'not_available': 'гости не доступны для проверки',
+        'no_children_in_deeplink': 'дети не в диплинке',
+        'no_guest_input': 'нет поля ввода гостей',
+        'children_not_supported': 'дети не поддерживаются',
+        'mismatch': 'несовпадение количества гостей ❌',
+    }
+    
+    print(f"\n👥 4. Работа с гостями (из {len(with_widget)} с виджетом TL):")
+    for value, count in guests_counter.most_common():
+        label = guests_labels.get(value, value)
+        pct = count * 100 / len(with_widget) if with_widget else 0
+        print(f"   {count:4d} ({pct:5.2f}%) — {label}")
+    
+    print(f"\n   Выбор детей в виджете:")
+    print(f"   {selectable_true:4d} — можно выбрать детей")
+    print(f"   {selectable_false:4d} — нельзя выбрать детей")
+    if selectable_unknown:
+        print(f"   {selectable_unknown:4d} — не определено")
+    
+    # --- 5. Сайт не загрузился ---
+    # Исключаем no_rooms — у них page_loaded=False как дефолт (сайт не проверялся)
+    page_not_loaded = [r for r in rows if r.get('status') == 'failed']
+    no_travelline = [r for r in rows if
+        r.get('check_page_loaded') == 'True' and
+        r.get('check_has_travelline') == 'False'
+    ]
+    
+    print(f"\n🌐 5. Проблемы с загрузкой сайта:")
+    print(f"   Страница не загрузилась: {len(page_not_loaded)}")
+    print(f"   Виджет TravelLine не найден (страница ОК): {len(no_travelline)}")
+    
+    # --- 6. Нет комнат ---
+    # Количество дат: основная + 18 fallback с детьми + основная + 18 fallback без детей = до 38
+    MAX_DATES_TRIED = 38
+    print(f"\n📭 6. Нет комнат: {len(no_rooms)}")
+    if no_rooms:
+        print(f"   (для каждого отеля проверяется до {MAX_DATES_TRIED} комбинаций дат)")
+    
+    # --- 7. Не совпало название ---
+    name_mismatch = [r for r in checked_on_site if r.get('check_name_matches') == 'False']
+    
+    print(f"\n🏷️  7. Не совпало название: {len(name_mismatch)}")
+    
+    # --- Итого ---
+    print(f"\n{'='*60}")
+    print(f"  Итого: {len(success)} из {total} полностью ОК ({len(success)*100/total:.2f}%)")
+    if only_price_mismatch:
+        ok_plus_price = len(success) + len(only_price_mismatch)
+        print(f"  С учётом «только цена»: {ok_plus_price} из {total} ({ok_plus_price*100/total:.2f}%)")
+    print(f"{'='*60}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Проверка диплинков отелей TL Integration')
     subparsers = parser.add_subparsers(dest='command', help='Команды')
@@ -2626,6 +3199,10 @@ def main():
     report_parser = subparsers.add_parser('report', help='Показать отчёт')
     report_parser.add_argument('--results', type=str, default='deeplink_results.csv', help='Файл результатов')
     
+    # Команда summary - подробное саммари
+    summary_parser = subparsers.add_parser('summary', help='Подробное саммари по результатам')
+    summary_parser.add_argument('--results', type=str, default='deeplinks_results.csv', help='CSV файл с результатами')
+    
     # Команда merge - объединить результаты
     merge_parser = subparsers.add_parser('merge', help='Объединить CSV файлы результатов')
     merge_parser.add_argument('--pattern', type=str, default='deeplink_results_*.csv', help='Паттерн файлов')
@@ -2658,8 +3235,8 @@ def main():
     check_parser.add_argument('--hotels', type=str, default='hotels_id_name.json', help='Файл с отелями')
     check_parser.add_argument('--output', type=str, default='deeplink_results.csv', help='Выходной CSV')
     check_parser.add_argument('--gui', action='store_true', help='Показать окно браузера')
-    check_parser.add_argument('--recheck', type=str, choices=['guests', 'price', 'failed', 'partial', 'all', 'deeplinks', 'children'],
-                              help='Перепроверить: guests/price/failed/partial/all/deeplinks/children')
+    check_parser.add_argument('--recheck', type=str, choices=['guests', 'guests-na', 'price', 'failed', 'partial', 'all', 'deeplinks', 'children', 'no_rooms'],
+                              help='Перепроверить: guests/guests-na/price/failed/partial/all/deeplinks/children/no_rooms')
     check_parser.add_argument('--from-csv', action='store_true',
                               help='Использовать диплинки из CSV вместо API (комбинируется с --recheck)')
     check_parser.add_argument('--only-dates', action='store_true',
@@ -2692,6 +3269,8 @@ def main():
         cmd_check(args)
     elif args.command == 'sync':
         cmd_sync(args)
+    elif args.command == 'summary':
+        cmd_summary(args)
     else:
         parser.print_help()
 

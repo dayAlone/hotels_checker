@@ -69,7 +69,8 @@ python3 sync_google_sheet.py
 
 **CSV колонки:**
 - `hotel_id`, `hotel_name` — идентификация
-- `status` — success/partial/failed/no_access/no_rooms
+- `status` — success/partial/failed/no_access/no_rooms/ibe_only
+- `api_status` — ok/ibe_only (источник диплинка: Partner API или IBE)
 - `check_*` — результаты отдельных проверок (True/False)
 - `guests_info` — детали проверки гостей: `correct`, `children_as_adults`, `not_available`, `no_children_in_deeplink`, `no_guest_input`, `children_not_supported`, `mismatch`
 - `children_selectable` — `True`/`False` (определяется по тексту гостевого дропдауна)
@@ -96,11 +97,23 @@ python3 sync_google_sheet.py
 - При исчерпании скрипт автоматически ждёт до сброса
 - Заголовки: `X-RateLimit-Remaining-Hour`, `Retry-After`
 
-### Fallback даты
+### Fallback даты (Partner API)
 Если нет комнат на основную дату, пробует:
-1. С детьми: март, апрель, май, октябрь × 1н/4н
+1. С детьми: фев–дек × 1н/4н
 2. Без детей: основная дата + те же fallback-даты
-Итого до 18 API-запросов на отель.
+
+### IBE API fallback (TravelLine Booking Engine)
+Если Partner API не нашёл номеров, скрипт обращается к IBE API (`ru-ibe.tlintegration.ru`):
+
+1. `nearest_available_dates` → получает ближайшие даты (разница start–end = min stay)
+2. `hotel_availability` → быстрая проверка: есть ли реально номера (отсекает ложные даты)
+3. Если IBE нет номеров → 1 запрос Partner API с точными IBE-датами (подстраховка)
+4. Если IBE есть номера → Partner API со всеми вариантами дат (exact, +1н, +2н)
+5. Если Partner API не помог → IBE диплинк (статус `ibe_only`, браузерная проверка не запускается)
+
+Режим `--recheck no_rooms` пропускает стандартные fallback-даты и сразу идёт в IBE.
+
+Классы с IBE-методами: `DeeplinkCollector._ibe_api_fallback()`, `CombinedChecker._ibe_api_fallback()`, `._ibe_nearest_dates()`, `._ibe_get_rooms()`.
 
 ### Playwright особенности
 - Используется headless Chromium, с автоматическим fallback на WebKit (Safari) для anti-bot сайтов
@@ -160,6 +173,7 @@ TravelLine использует специальные пробелы:
 ### Добавить режим --recheck
 1. Добавить в `choices` в argparse (`check_parser`)
 2. Добавить условие в `CombinedChecker.load_checked()` (блок `if self.recheck`)
+3. При необходимости особой логики — добавить в `CombinedChecker.run()` (см. `self.recheck == 'no_rooms'`)
 
 ### Отладка проверки страницы
 ```bash
