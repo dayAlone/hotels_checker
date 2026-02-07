@@ -19,6 +19,8 @@
 - Умный поиск TL iframe по наличию дат в input-полях (обход вложенных/множественных iframe)
 - Детекция пустого виджета «Здесь пока ничего нет» → статус `no_rooms`
 - Защита от ложных срабатываний ошибок в JS/JSON-строках локализации
+- WebKit (Safari) fallback для сайтов с anti-bot защитой (Radisson и др.)
+- Автоматический клик по cookie-consent и accept-кнопкам перед проверкой виджета
 
 ## Установка
 
@@ -30,8 +32,9 @@ source venv/bin/activate
 # Установить зависимости
 pip install -r requirements.txt
 
-# Установить браузер для Playwright
+# Установить браузеры для Playwright
 PLAYWRIGHT_BROWSERS_PATH=0 playwright install chromium
+PLAYWRIGHT_BROWSERS_PATH=0 playwright install webkit  # для anti-bot fallback
 ```
 
 ## Настройка
@@ -253,7 +256,21 @@ python3 check_deeplinks.py report --results results.csv
 - Блокируются запросы на изображения, видео и шрифты (`image`, `media`, `font`)
 - Стили (`stylesheet`) загружаются для корректного отображения виджетов
 - Маскируется `navigator.webdriver` для обхода антибот-защит
-- Cookie-баннеры и оверлеи удаляются автоматически
+- Cookie-баннеры и оверлеи удаляются автоматически (клик по кнопкам + удаление через CSS)
+
+## Anti-bot защита (WebKit fallback)
+
+Некоторые сайты (например, Radisson) блокируют Chromium headless на уровне TLS-fingerprint (`ERR_HTTP2_PROTOCOL_ERROR`). Для таких случаев скрипт автоматически:
+
+1. Обнаруживает ошибки соединения (`ERR_HTTP2_PROTOCOL_ERROR`, `ERR_CONNECTION_RESET` и др.)
+2. Запускает WebKit (Safari engine) с другим TLS-fingerprint
+3. Повторяет навигацию через WebKit
+4. После проверки возвращается к Chromium для следующих отелей
+
+В логе отображается `(anti-bot → webkit)`. Требует установки WebKit:
+```bash
+PLAYWRIGHT_BROWSERS_PATH=0 playwright install webkit
+```
 
 ## Rate Limits
 

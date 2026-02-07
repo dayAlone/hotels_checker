@@ -103,13 +103,25 @@ python3 sync_google_sheet.py
 Итого до 18 API-запросов на отель.
 
 ### Playwright особенности
-- Используется headless Chromium
+- Используется headless Chromium, с автоматическим fallback на WebKit (Safari) для anti-bot сайтов
 - Маскировка `navigator.webdriver` для обхода детекции ботов
 - Блокировка тяжёлых ресурсов (`image`, `media`, `font`) — стили (`stylesheet`) оставлены
 - TravelLine виджет в iframe — нужно ждать загрузки
 - Контент iframe доступен через `frame.locator('body').inner_text()`
 - Input values (даты, гости) доступны через `input.input_value()`
-- Cookie-баннеры и оверлеи удаляются через `_dismiss_overlays()`
+- Cookie-баннеры и оверлеи: сначала клик по кнопкам согласия (accept/хорошо/принять), затем удаление через CSS-селекторы
+- `_dismiss_overlays()` вызывается **перед** `wait_for_widget()` — некоторые виджеты не инициализируются до принятия куков
+
+### WebKit fallback (anti-bot)
+Сайты типа Radisson блокируют Chromium headless по TLS-fingerprint. Механизм:
+1. `check_hotel()` ловит ошибки навигации (`ERR_HTTP2_PROTOCOL_ERROR`, `ERR_CONNECTION_RESET` и др.)
+2. `_is_antibot_error()` определяет тип ошибки
+3. `_launch_webkit_fallback(url)` запускает WebKit браузер, подменяет `self.page`
+4. После проверки `_cleanup_webkit_fallback()` закрывает WebKit и возвращает Chromium page
+
+Ошибки-маркеры anti-bot: `_WEBKIT_ERRORS` — список строк в `BrowserChecker` и `CombinedChecker`.
+
+**Важно:** WebKit установлен отдельно: `PLAYWRIGHT_BROWSERS_PATH=0 playwright install webkit`
 
 ### Поиск TL iframe (`_get_tl_frame`)
 Двухэтапный поиск правильного виджета бронирования:

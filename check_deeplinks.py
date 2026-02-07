@@ -155,7 +155,8 @@ class PageAnalyzer:
         errors = []
         
         # 1. Страница загрузилась - есть контент
-        results['page_loaded'] = len(snapshot) > 200 and len(page_title) > 0
+        # Достаточно наличия контента (некоторые сайты не устанавливают <title>)
+        results['page_loaded'] = len(snapshot) > 200
         if not results['page_loaded']:
             errors.append('Страница не загрузилась')
         
@@ -1087,6 +1088,26 @@ class BrowserChecker:
     
     def _dismiss_overlays(self):
         """Закрыть cookie-баннеры и другие оверлеи на основной странице."""
+        # Шаг 1: кликаем по кнопкам согласия (accept/cookie/ok)
+        BUTTON_TEXTS = [
+            'accept all cookies', 'accept all', 'accept essential cookies only',
+            'accept', 'хорошо', 'принять', 'принять все', 'ок', 'ok', 'agree',
+            'понятно', 'согласен', 'i agree', 'got it', 'allow all'
+        ]
+        try:
+            buttons = self.page.query_selector_all('button, a.btn, a[class*="btn"], [role="button"], input[type="button"]')
+            for btn in buttons:
+                try:
+                    text = btn.inner_text().strip().lower()
+                    if text in BUTTON_TEXTS:
+                        btn.click(timeout=2000)
+                        time.sleep(0.3)
+                except:
+                    pass
+        except:
+            pass
+        
+        # Шаг 2: удаляем оставшиеся оверлеи через CSS-селекторы
         try:
             self.page.evaluate('''() => {
                 const selectors = [
@@ -1199,16 +1220,29 @@ class BrowserChecker:
             'error': ''
         }
         
+        webkit_used = False
         try:
             # Переходим на страницу
             try:
                 self.page.goto(deeplink, timeout=15000, wait_until='domcontentloaded')
             except Exception as nav_err:
-                err_msg = str(nav_err).lower()
-                if 'interrupted' in err_msg or 'navigating' in err_msg:
+                err_msg = str(nav_err)
+                if self._is_antibot_error(err_msg):
+                    # Anti-bot блокировка — пробуем WebKit (Safari engine)
+                    print("(anti-bot → webkit)", end=' ')
+                    if not self._launch_webkit_fallback(deeplink):
+                        result['error'] = f'Anti-bot block (Chromium + WebKit failed)'
+                        self.saver.save_skipped(hotel_id, hotel_name, 'failed', result['error'], deeplink=deeplink)
+                        self._recover_page()
+                        return result
+                    webkit_used = True
+                elif 'interrupted' in err_msg.lower() or 'navigating' in err_msg.lower():
                     time.sleep(2)
                 else:
                     raise
+            
+            # Закрываем оверлеи (cookie-баннеры, accept-диалоги) перед ожиданием виджета
+            self._dismiss_overlays()
             
             # Ждём загрузки виджета с правильными датами
             widget_loaded = self.wait_for_widget(expected_date=arrival_date)
@@ -1218,6 +1252,8 @@ class BrowserChecker:
                 self.saver.save_skipped(hotel_id, hotel_name, 'no_rooms',
                                         'Виджет: Здесь пока ничего нет', deeplink=deeplink)
                 result['status'] = 'no_rooms'
+                if webkit_used:
+                    self._cleanup_webkit_fallback()
                 return result
             
             # Получаем данные страницы
@@ -1267,11 +1303,67 @@ class BrowserChecker:
             result['error'] = str(e)[:200]
             self.saver.save_skipped(hotel_id, hotel_name, 'failed', str(e)[:200], deeplink=deeplink)
             self._recover_page()
+        finally:
+            if webkit_used:
+                self._cleanup_webkit_fallback()
         
         return result
     
+    # --- WebKit fallback для сайтов с anti-bot (Radisson и др.) ---
+    
+    _WEBKIT_ERRORS = ['err_http2_protocol_error', 'err_connection_reset', 'err_connection_closed',
+                      'err_ssl_protocol_error', 'err_connection_refused']
+    
+    def _is_antibot_error(self, error_msg: str) -> bool:
+        """Определить, похожа ли ошибка на anti-bot блокировку."""
+        err_lower = error_msg.lower()
+        return any(marker in err_lower for marker in self._WEBKIT_ERRORS)
+    
+    def _launch_webkit_fallback(self, url: str) -> bool:
+        """Запустить WebKit и перейти на URL. Подменяет self.page на WebKit-страницу.
+        
+        Returns: True если навигация успешна.
+        """
+        try:
+            self._webkit_browser = self.playwright.webkit.launch(headless=True)
+            self._webkit_context = self._webkit_browser.new_context(
+                viewport={'width': 1280, 'height': 720},
+                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+            )
+            # Блокируем тяжёлые ресурсы как и в Chromium
+            self._webkit_context.route('**/*', lambda route: route.abort() 
+                if route.request.resource_type in ('image', 'media', 'font')
+                else route.continue_())
+            self._webkit_page = self._webkit_context.new_page()
+            
+            # Сохраняем оригинальную страницу и подменяем
+            self._chromium_page = self.page
+            self.page = self._webkit_page
+            
+            self.page.goto(url, timeout=20000, wait_until='domcontentloaded')
+            return True
+        except Exception as e:
+            print(f"(webkit fallback failed: {str(e)[:60]})", end=' ')
+            self._cleanup_webkit_fallback()
+            return False
+    
+    def _cleanup_webkit_fallback(self):
+        """Закрыть WebKit и вернуть Chromium page."""
+        try:
+            if hasattr(self, '_webkit_browser') and self._webkit_browser:
+                self._webkit_browser.close()
+                self._webkit_browser = None
+        except:
+            pass
+        
+        if hasattr(self, '_chromium_page') and self._chromium_page:
+            self.page = self._chromium_page
+            self._chromium_page = None
+    
     def _recover_page(self):
         """Сбросить страницу после ошибки навигации."""
+        # Чистим WebKit fallback если был
+        self._cleanup_webkit_fallback()
         try:
             self.page.goto('about:blank', timeout=5000)
         except:
@@ -1743,6 +1835,26 @@ class CombinedChecker:
     
     def _dismiss_overlays(self):
         """Закрыть cookie-баннеры и другие оверлеи на основной странице."""
+        # Шаг 1: кликаем по кнопкам согласия (accept/cookie/ok)
+        BUTTON_TEXTS = [
+            'accept all cookies', 'accept all', 'accept essential cookies only',
+            'accept', 'хорошо', 'принять', 'принять все', 'ок', 'ok', 'agree',
+            'понятно', 'согласен', 'i agree', 'got it', 'allow all'
+        ]
+        try:
+            buttons = self.page.query_selector_all('button, a.btn, a[class*="btn"], [role="button"], input[type="button"]')
+            for btn in buttons:
+                try:
+                    text = btn.inner_text().strip().lower()
+                    if text in BUTTON_TEXTS:
+                        btn.click(timeout=2000)
+                        time.sleep(0.3)
+                except:
+                    pass
+        except:
+            pass
+        
+        # Шаг 2: удаляем оставшиеся оверлеи через CSS-селекторы
         try:
             self.page.evaluate('''() => {
                 const selectors = [
@@ -1839,17 +1951,27 @@ class CombinedChecker:
                     price: float, arrival_date: str) -> dict:
         """Проверить страницу отеля."""
         children_count = len(self.children_ages)
+        webkit_used = False
         
         try:
             try:
                 self.page.goto(deeplink, timeout=15000, wait_until='domcontentloaded')
             except Exception as nav_err:
-                err_msg = str(nav_err).lower()
-                # Если навигация прервана редиректом — страница всё равно загрузилась
-                if 'interrupted' in err_msg or 'navigating' in err_msg:
+                err_msg = str(nav_err)
+                if self._is_antibot_error(err_msg):
+                    # Anti-bot блокировка — пробуем WebKit (Safari engine)
+                    print("(anti-bot → webkit)", end=' ')
+                    if not self._launch_webkit_fallback(deeplink):
+                        return {'status': 'failed', 'analysis': None, 'page_title': '',
+                                'error': 'Anti-bot block (Chromium + WebKit failed)', 'widget_time': ''}
+                    webkit_used = True
+                elif 'interrupted' in err_msg.lower() or 'navigating' in err_msg.lower():
                     time.sleep(2)  # ждём завершения редиректа
                 else:
                     raise
+            
+            # Закрываем оверлеи (cookie-баннеры, accept-диалоги) перед ожиданием виджета
+            self._dismiss_overlays()
             
             widget_loaded, widget_time = self.wait_for_widget(expected_date=arrival_date)
             
@@ -1896,9 +2018,65 @@ class CombinedChecker:
         except Exception as e:
             self._recover_page()
             return {'status': 'failed', 'analysis': None, 'page_title': '', 'error': str(e)[:200], 'widget_time': ''}
+        finally:
+            if webkit_used:
+                self._cleanup_webkit_fallback()
+    
+    # --- WebKit fallback для сайтов с anti-bot (Radisson и др.) ---
+    
+    _WEBKIT_ERRORS = ['err_http2_protocol_error', 'err_connection_reset', 'err_connection_closed',
+                      'err_ssl_protocol_error', 'err_connection_refused']
+    
+    def _is_antibot_error(self, error_msg: str) -> bool:
+        """Определить, похожа ли ошибка на anti-bot блокировку."""
+        err_lower = error_msg.lower()
+        return any(marker in err_lower for marker in self._WEBKIT_ERRORS)
+    
+    def _launch_webkit_fallback(self, url: str) -> bool:
+        """Запустить WebKit и перейти на URL. Подменяет self.page на WebKit-страницу.
+        
+        Returns: True если навигация успешна.
+        """
+        try:
+            self._webkit_browser = self.playwright.webkit.launch(headless=True)
+            self._webkit_context = self._webkit_browser.new_context(
+                viewport={'width': 1280, 'height': 720},
+                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+            )
+            # Блокируем тяжёлые ресурсы как и в Chromium
+            self._webkit_context.route('**/*', lambda route: route.abort() 
+                if route.request.resource_type in ('image', 'media', 'font')
+                else route.continue_())
+            self._webkit_page = self._webkit_context.new_page()
+            
+            # Сохраняем оригинальную страницу и подменяем
+            self._chromium_page = self.page
+            self.page = self._webkit_page
+            
+            self.page.goto(url, timeout=20000, wait_until='domcontentloaded')
+            return True
+        except Exception as e:
+            print(f"(webkit fallback failed: {str(e)[:60]})", end=' ')
+            self._cleanup_webkit_fallback()
+            return False
+    
+    def _cleanup_webkit_fallback(self):
+        """Закрыть WebKit и вернуть Chromium page."""
+        try:
+            if hasattr(self, '_webkit_browser') and self._webkit_browser:
+                self._webkit_browser.close()
+                self._webkit_browser = None
+        except:
+            pass
+        
+        if hasattr(self, '_chromium_page') and self._chromium_page:
+            self.page = self._chromium_page
+            self._chromium_page = None
     
     def _recover_page(self):
         """Сбросить страницу после ошибки навигации."""
+        # Чистим WebKit fallback если был
+        self._cleanup_webkit_fallback()
         try:
             self.page.goto('about:blank', timeout=5000)
         except:
