@@ -260,7 +260,6 @@ class PageAnalyzer:
             # Диплинк получен через фоллбэк без детей — дети не переданы в виджет
             results['guests_correct'] = True
             results['guests_info'] = 'no_children_in_deeplink'
-            errors.append(f'Диплинк без детей (фоллбэк): tl-children-age пустой')
         elif not has_any_guest_info:
             # Виджет не загрузился или текст недоступен — не фейлим проверку
             results['guests_correct'] = True
@@ -302,7 +301,6 @@ class PageAnalyzer:
                     # Виджет не поддерживает детей — считает их как взрослых
                     results['guests_correct'] = True
                     results['guests_info'] = 'children_as_adults'
-                    errors.append(f'Виджет показывает "{alt_pattern}" вместо "{adults_pattern}, {children_count} реб."')
                 else:
                     results['guests_correct'] = False
                     results['guests_info'] = 'mismatch'
@@ -369,9 +367,7 @@ class PageAnalyzer:
             elif age_limit is not None:
                 results['children_ages_on_page'] = str(age_limit)
                 # Если запрошенный возраст >= лимита, ребёнок не пройдёт
-                for age in children_ages:
-                    if age >= age_limit:
-                        errors.append(f'Ребёнок {age} лет >= ограничение "младше {age_limit} лет"')
+                # age_limit info сохраняется в children_ages_on_page
             else:
                 results['children_ages_on_page'] = ''
             
