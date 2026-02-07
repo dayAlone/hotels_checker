@@ -15,6 +15,10 @@
 - Автоматическое удаление cookie-баннеров и оверлеев перед взаимодействием с виджетом
 - Восстановление страницы браузера после ошибок навигации
 - Замер времени загрузки виджета
+- Блокировка тяжёлых ресурсов (изображения, видео, шрифты) для ускорения загрузки
+- Умный поиск TL iframe по наличию дат в input-полях (обход вложенных/множественных iframe)
+- Детекция пустого виджета «Здесь пока ничего нет» → статус `no_rooms`
+- Защита от ложных срабатываний ошибок в JS/JSON-строках локализации
 
 ## Установка
 
@@ -64,6 +68,7 @@ python3 check_deeplinks.py check \
 - `--gui` — показать окно браузера (по умолчанию headless)
 - `--recheck` — перепроверить отели (см. ниже)
 - `--from-csv` — использовать диплинки из CSV вместо API
+- `--only-dates` — перепроверять только отели с корректными датами (`check_dates_correct=True`)
 
 ### Перепроверка (`--recheck`)
 
@@ -87,6 +92,13 @@ python3 check_deeplinks.py check \
   --output results.csv \
   --adults 1 --children 7 \
   --recheck guests --from-csv
+
+# Перепроверить цены с перезапросом из API, только с корректными датами
+python3 check_deeplinks.py check \
+  --hotels hotels_id_name.json \
+  --output results.csv \
+  --adults 1 --children 7 \
+  --recheck price --only-dates
 
 # Перепроверить определение детей по существующим диплинкам
 python3 check_deeplinks.py check \
@@ -151,7 +163,7 @@ python3 check_deeplinks.py report --results results.csv
 | `check_page_loaded` | Страница загрузилась |
 | `check_name_matches` | Название отеля совпадает |
 | `check_has_travelline` | Есть виджет TravelLine |
-| `check_no_errors` | Нет сообщений об ошибках |
+| `check_no_errors` | Нет сообщений об ошибках (в видимом тексте, без JS/JSON) |
 | `check_dates_correct` | Даты в виджете совпадают |
 | `check_guests_correct` | Гости отображаются корректно |
 | `check_price_correct` | Цена совпадает с API |
@@ -160,10 +172,10 @@ python3 check_deeplinks.py report --results results.csv
 
 | Поле | Описание |
 |------|----------|
-| `guests_info` | Детали: `correct`, `mismatch`, `children_as_adults` |
+| `guests_info` | Детали: `correct`, `mismatch`, `children_as_adults`, `not_available`, `no_children_in_deeplink` |
 | `children_ages_in_url` | Возраст детей присутствует в URL диплинка |
-| `children_ages_on_page` | Возраст найден на странице: `7`, `limit_6`, `not_found` |
-| `children_selectable` | Можно ли выбрать детей: `yes`, `no`, `yes_limit_18` |
+| `children_ages_on_page` | Возраст / лимит возраста на странице (число) |
+| `children_selectable` | Можно ли выбрать детей в виджете: `True` / `False` |
 | `widget_load_time` | Время загрузки виджета TravelLine (секунды) |
 
 ## Статусы
@@ -172,7 +184,7 @@ python3 check_deeplinks.py report --results results.csv
 - `partial` — часть проверок не пройдена
 - `failed` — страница не загрузилась / ошибка навигации
 - `no_access` — нет доступа к отелю (API 403)
-- `no_rooms` — нет доступных комнат ни на одну дату
+- `no_rooms` — нет доступных комнат (API не вернул номеров, или виджет показывает «Здесь пока ничего нет»)
 
 ## Логика поиска комнат
 
@@ -184,6 +196,14 @@ python3 check_deeplinks.py report --results results.csv
 4. Без детей + fallback-даты
 
 Итого до **18 API-запросов** на отель без комнат.
+
+## Оптимизация загрузки
+
+Для ускорения проверки страниц:
+- Блокируются запросы на изображения, видео и шрифты (`image`, `media`, `font`)
+- Стили (`stylesheet`) загружаются для корректного отображения виджетов
+- Маскируется `navigator.webdriver` для обхода антибот-защит
+- Cookie-баннеры и оверлеи удаляются автоматически
 
 ## Rate Limits
 

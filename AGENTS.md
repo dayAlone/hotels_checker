@@ -8,8 +8,8 @@
 
 ```
 check_deeplinks.py
-├── TokenManager          # Управление OAuth токеном
-├── PageAnalyzer          # Анализ содержимого страницы  
+├── TokenManager          # Управление OAuth токеном (Basic auth → Bearer)
+├── PageAnalyzer          # Анализ содержимого страницы (7 критериев)
 ├── DeeplinkCollector     # Сбор диплинков из API
 ├── ResultsSaver          # Сохранение результатов в CSV
 ├── BrowserChecker        # Проверка через Playwright (для команды auto)
@@ -29,6 +29,20 @@ PLAYWRIGHT_BROWSERS_PATH=0 python3 check_deeplinks.py check \
   --output results.csv \
   --adults 1 --children 7
 
+# Перепроверка цен с новыми диплинками, только с корректными датами
+PLAYWRIGHT_BROWSERS_PATH=0 python3 check_deeplinks.py check \
+  --hotels hotels_id_name.json \
+  --output results.csv \
+  --adults 1 --children 7 \
+  --recheck price --only-dates
+
+# Перепроверка по существующим диплинкам (без API)
+PLAYWRIGHT_BROWSERS_PATH=0 python3 check_deeplinks.py check \
+  --hotels hotels_id_name.json \
+  --output results.csv \
+  --adults 1 --children 7 \
+  --recheck guests --from-csv
+
 # Только сбор диплинков
 python3 check_deeplinks.py collect --hotels hotels.json --output deeplinks.json
 
@@ -38,7 +52,7 @@ PLAYWRIGHT_BROWSERS_PATH=0 python3 check_deeplinks.py auto --deeplinks deeplinks
 
 ## Формат входных данных
 
-**hotels_id_name.json:**
+**hotels_id_name.json / hotels_id_name_whitelist.json:**
 ```json
 [
   {"id": "12345", "name": "Название отеля"},
@@ -52,7 +66,11 @@ PLAYWRIGHT_BROWSERS_PATH=0 python3 check_deeplinks.py auto --deeplinks deeplinks
 - `hotel_id`, `hotel_name` — идентификация
 - `status` — success/partial/failed/no_access/no_rooms
 - `check_*` — результаты отдельных проверок (True/False)
+- `guests_info` — детали проверки гостей: `correct`, `mismatch`, `children_as_adults`, `not_available`, `no_children_in_deeplink`
+- `children_selectable` — `True`/`False` (определяется по тексту гостевого дропдауна)
+- `children_ages_on_page` — числовой возраст или лимит
 - `expected_price` — цена из API
+- `widget_load_time` — время загрузки виджета (секунды)
 - `error_details` — описание ошибок
 - `deeplink` — URL для бронирования
 
@@ -61,7 +79,7 @@ PLAYWRIGHT_BROWSERS_PATH=0 python3 check_deeplinks.py auto --deeplinks deeplinks
 1. **page_loaded** — страница загрузилась (content > 100 символов)
 2. **name_matches** — название отеля найдено на странице
 3. **has_travelline** — есть iframe с виджетом TravelLine
-4. **no_errors** — нет текста ошибок (404, не найден, etc.)
+4. **no_errors** — нет текста ошибок (проверяется только видимый текст, `<script>`/`<style>` теги исключаются)
 5. **dates_correct** — дата в виджете совпадает с запросом
 6. **guests_correct** — количество гостей отображается верно
 7. **price_correct** — цена на странице совпадает с API
@@ -75,21 +93,39 @@ PLAYWRIGHT_BROWSERS_PATH=0 python3 check_deeplinks.py auto --deeplinks deeplinks
 
 ### Fallback даты
 Если нет комнат на основную дату, пробует:
-1. Март (2026-03-01)
-2. Октябрь неделя (2026-10-01 — 2026-10-08)
+1. С детьми: март, апрель, май, октябрь × 1н/4н
+2. Без детей: основная дата + те же fallback-даты
+Итого до 18 API-запросов на отель.
 
 ### Playwright особенности
 - Используется headless Chromium
-- Маскировка webdriver для обхода детекции ботов
+- Маскировка `navigator.webdriver` для обхода детекции ботов
+- Блокировка тяжёлых ресурсов (`image`, `media`, `font`) — стили (`stylesheet`) оставлены
 - TravelLine виджет в iframe — нужно ждать загрузки
 - Контент iframe доступен через `frame.locator('body').inner_text()`
 - Input values (даты, гости) доступны через `input.input_value()`
+- Cookie-баннеры и оверлеи удаляются через `_dismiss_overlays()`
+
+### Поиск TL iframe (`_get_tl_frame`)
+Двухэтапный поиск правильного виджета бронирования:
+1. **page.frames** — итерация по фреймам, пропуск main_frame и `reputation`, поиск по наличию даты в input
+2. **frame_locator** — fallback для cross-origin iframe, приоритет `booking` виджетам
+
+Критерий: input-поле содержит название месяца (января, февраля, ...). Если ни один фрейм не содержит дату, берётся первый с input-полями.
+
+### Детекция «Здесь пока ничего нет»
+Метод `_check_widget_no_rooms()` проверяет все TL-фреймы (включая без input-полей) на текст «Здесь пока ничего нет» или «нет доступных». При обнаружении — статус `no_rooms`.
+
+### Определение `children_selectable`
+Анализируется **только текст гостевого дропдауна** (`guests_dropdown_text`), а не весь snapshot. Это исключает ложные срабатывания от слов «дети» в описании отеля. Если дропдаун не открылся — `False`.
 
 ### Нормализация текста
 TravelLine использует специальные пробелы:
-- `\xa0` (NBSP)
-- `\u2009` (thin space)
+- `\xa0` (NBSP), `\u2009` (thin space), `\u202f` (narrow NBSP)
 Все нормализуются в обычные пробелы перед поиском.
+
+### Проверка ошибок (no_errors)
+Ошибки ищутся только в **видимом тексте** — `<script>` и `<style>` теги удаляются перед проверкой. Это предотвращает ложные срабатывания на строки локализации в JS/JSON (например, `"errors":{"404":"страница не найдена"}`).
 
 ## Типичные задачи
 
@@ -97,19 +133,23 @@ TravelLine использует специальные пробелы:
 1. Добавить поле в `results` dict в `PageAnalyzer.analyze()`
 2. Реализовать логику проверки
 3. Добавить в `get_status()` если влияет на итоговый статус
-4. Добавить колонку в `CSV_FIELDS` в `ResultsSaver`
+4. Добавить колонку в `CSV_FIELDS` в `ResultsSaver` и `CombinedChecker.save_result()`
 
 ### Изменить fallback даты
 Редактировать `fallback_dates` в:
 - `DeeplinkCollector.try_fallback_dates()`
 - `CombinedChecker.get_deeplink()`
 
+### Добавить режим --recheck
+1. Добавить в `choices` в argparse (`check_parser`)
+2. Добавить условие в `CombinedChecker.load_checked()` (блок `if self.recheck`)
+
 ### Отладка проверки страницы
-```python
-# В check_deeplinks.py добавить отладочный вывод:
-print(f"Content length: {len(page_content)}")
-print(f"Looking for: {hotel_name}")
-print(f"Found: {hotel_name.lower() in page_content.lower()}")
+```bash
+# Запуск с GUI для визуальной отладки
+PLAYWRIGHT_BROWSERS_PATH=0 python3 check_deeplinks.py check \
+  --hotels /tmp/test.json --output /tmp/test.csv \
+  --adults 1 --children 7 --gui --recheck all
 ```
 
 ## Переменные окружения
@@ -120,3 +160,5 @@ TL_AUTH_KEY=base64_encoded_credentials
 ```
 
 Получить ключ: Base64 от `username:password` для TravelLine Partner API.
+
+**PLAYWRIGHT_BROWSERS_PATH=0** — обязательно при запуске Playwright (указывает на локальные браузеры в venv).

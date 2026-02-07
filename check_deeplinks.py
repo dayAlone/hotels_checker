@@ -183,7 +183,12 @@ class PageAnalyzer:
             errors.append('Виджет TravelLine не найден')
         
         # 4. Нет сообщений об ошибках (проверяем строгие паттерны)
-        found_errors = [err for err in PageAnalyzer.ERROR_PATTERNS if err in snapshot_lower or err in title_lower]
+        # Используем только видимый текст (без HTML/JS), чтобы исключить ложные срабатывания
+        # на строки локализации внутри <script> или JSON-данных
+        visible_text = re.sub(r'<script[^>]*>.*?</script>', '', snapshot_lower, flags=re.DOTALL)
+        visible_text = re.sub(r'<style[^>]*>.*?</style>', '', visible_text, flags=re.DOTALL)
+        visible_text = re.sub(r'<[^>]+>', '', visible_text)
+        found_errors = [err for err in PageAnalyzer.ERROR_PATTERNS if err in visible_text or err in title_lower]
         if found_errors:
             results['no_errors'] = False
             errors.append(f'Найдены ошибки: {", ".join(found_errors)}')
@@ -889,6 +894,10 @@ class BrowserChecker:
         )
         # Маскируем webdriver чтобы TravelLine виджет загружался
         self.context.add_init_script('Object.defineProperty(navigator, "webdriver", {get: () => undefined});')
+        # Блокируем тяжёлые ресурсы (картинки, видео, шрифты) для ускорения загрузки
+        self.context.route('**/*', lambda route: route.abort() 
+            if route.request.resource_type in ('image', 'media', 'font')
+            else route.continue_())
         self.page = self.context.new_page()
     
     def stop_browser(self):
@@ -964,25 +973,76 @@ class BrowserChecker:
         return False
     
     def _get_tl_frame(self):
-        """Найти TL iframe: сначала через page.frames, потом через frame_locator."""
-        # Способ 1: через page.frames (работает для некоторых сайтов)
+        """Найти TL iframe: ищем фрейм с датами в input (стандартный виджет бронирования)."""
+        DATE_MARKERS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+                        'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря']
+        
+        # Способ 1: через page.frames — ищем фрейм с датой в input
         main_frame = self.page.main_frame
+        tl_frames = []
         for frame in self.page.frames:
             if frame == main_frame:
-                continue  # пропускаем главный фрейм (b.tlintegration.com/metasearch)
+                continue
             if 'tlintegration' in frame.url or 'travelline' in frame.url:
                 if 'reputation' in frame.url:
                     continue
-                return ('frame', frame)
+                tl_frames.append(frame)
+        
+        # Среди найденных TL-фреймов ищем тот, где input содержит дату
+        fallback_frame = None
+        for frame in tl_frames:
+            try:
+                inputs = frame.query_selector_all('input')
+                if not inputs:
+                    continue
+                if fallback_frame is None:
+                    fallback_frame = frame
+                for inp in inputs:
+                    try:
+                        val = inp.input_value().lower()
+                        if any(m in val for m in DATE_MARKERS):
+                            return ('frame', frame)
+                    except:
+                        pass
+            except:
+                pass
+        
+        # Если ни в одном фрейме нет даты — берём первый с inputs
+        if fallback_frame:
+            return ('frame', fallback_frame)
         
         # Способ 2: через frame_locator (работает для cross-origin iframe)
-        # Сначала ищем booking iframe, потом любой tlintegration
+        # Перебираем все TL iframe'ы и ищем тот, где input содержит дату
         for selector in ['iframe[src*="tlintegration"][src*="booking"]',
                          'iframe[src*="tlintegration"]']:
             try:
-                fl = self.page.frame_locator(selector).first
-                fl.locator('body').wait_for(timeout=2000)
-                return ('locator', fl)
+                count = self.page.locator(selector).count()
+                if count == 0:
+                    continue
+                
+                fallback_locator = None
+                for idx in range(count):
+                    try:
+                        fl = self.page.frame_locator(f'{selector} >> nth={idx}')
+                        fl.locator('body').wait_for(timeout=2000)
+                        inp_count = fl.locator('input').count()
+                        if inp_count == 0:
+                            continue
+                        if fallback_locator is None:
+                            fallback_locator = fl
+                        # Проверяем input на наличие даты
+                        for i in range(min(inp_count, 3)):
+                            try:
+                                val = fl.locator('input').nth(i).input_value(timeout=1000).lower()
+                                if any(m in val for m in DATE_MARKERS):
+                                    return ('locator', fl)
+                            except:
+                                pass
+                    except:
+                        pass
+                
+                if fallback_locator:
+                    return ('locator', fallback_locator)
             except:
                 pass
         
@@ -1157,6 +1217,13 @@ class BrowserChecker:
             # Ждём загрузки виджета с правильными датами
             widget_loaded = self.wait_for_widget(expected_date=arrival_date)
             
+            # Проверяем, не показывает ли виджет "Здесь пока ничего нет"
+            if not widget_loaded and self._check_widget_no_rooms():
+                self.saver.save_skipped(hotel_id, hotel_name, 'no_rooms',
+                                        'Виджет: Здесь пока ничего нет', deeplink=deeplink)
+                result['status'] = 'no_rooms'
+                return result
+            
             # Получаем данные страницы
             page_title = self.page.title()
             page_content = self.get_page_text()
@@ -1218,6 +1285,43 @@ class BrowserChecker:
             except:
                 pass
     
+    def _check_widget_no_rooms(self) -> bool:
+        """Проверить, показывает ли виджет TL сообщение 'Здесь пока ничего нет'."""
+        NO_ROOMS_MARKERS = ['здесь пока ничего нет', 'нет доступных']
+        try:
+            main_frame = self.page.main_frame
+            for frame in self.page.frames:
+                if frame == main_frame:
+                    continue
+                if 'tlintegration' in frame.url or 'travelline' in frame.url:
+                    try:
+                        text = frame.locator('body').inner_text(timeout=2000).lower()
+                        for sc in ['\xa0', '\u2009', '\u202f']:
+                            text = text.replace(sc, ' ')
+                        if any(m in text for m in NO_ROOMS_MARKERS):
+                            return True
+                    except:
+                        pass
+            # Также проверяем через frame_locator (cross-origin iframe)
+            for selector in ['iframe[src*="tlintegration"]', 'iframe[src*="travelline"]']:
+                try:
+                    count = self.page.locator(selector).count()
+                    for idx in range(count):
+                        try:
+                            fl = self.page.frame_locator(f'{selector} >> nth={idx}')
+                            text = fl.locator('body').inner_text(timeout=2000).lower()
+                            for sc in ['\xa0', '\u2009', '\u202f']:
+                                text = text.replace(sc, ' ')
+                            if any(m in text for m in NO_ROOMS_MARKERS):
+                                return True
+                        except:
+                            pass
+                except:
+                    pass
+        except:
+            pass
+        return False
+    
     def run(self, start: int = 0, limit: Optional[int] = None):
         """Запустить автоматическую проверку."""
         pending_count = self.load_data()
@@ -1239,7 +1343,7 @@ class BrowserChecker:
         print(f"🌐 Режим: {'headless' if self.headless else 'с GUI'}")
         print("-" * 50)
         
-        stats = {'success': 0, 'partial': 0, 'failed': 0}
+        stats = {'success': 0, 'partial': 0, 'failed': 0, 'no_rooms': 0}
         
         try:
             self.start_browser()
@@ -1252,6 +1356,8 @@ class BrowserChecker:
                 
                 if result['status'] == 'success':
                     print("✅")
+                elif result['status'] == 'no_rooms':
+                    print("📭 нет комнат (виджет)")
                 elif result['status'] == 'partial':
                     print(f"⚠️  {result.get('analysis', {}).get('error_details', '')[:40]}")
                 else:
@@ -1270,6 +1376,7 @@ class BrowserChecker:
         print(f"   ✅ Успешно: {stats['success']}")
         print(f"   ⚠️  Частично: {stats['partial']}")
         print(f"   ❌ Ошибки: {stats['failed']}")
+        print(f"   📭 Нет комнат: {stats['no_rooms']}")
         print(f"\n💾 Результаты сохранены в: {self.results_file}")
 
 
@@ -1278,7 +1385,7 @@ class CombinedChecker:
     
     def __init__(self, hotels_file: str, results_file: str, arrival_date: str, departure_date: str,
                  adults: int = 1, children_ages: list = None, headless: bool = True, recheck: str = None,
-                 from_csv: bool = False):
+                 from_csv: bool = False, only_dates: bool = False):
         self.hotels_file = Path(hotels_file)
         self.results_file = Path(results_file)
         self.arrival_date = arrival_date
@@ -1288,6 +1395,7 @@ class CombinedChecker:
         self.headless = headless
         self.recheck = recheck  # None, 'guests', 'price', 'failed', 'all', 'deeplinks'
         self.from_csv = from_csv  # Использовать диплинки из CSV вместо API
+        self.only_dates = only_dates  # Перепроверять только отели с check_dates_correct=True
         
         self.token_manager = TokenManager()
         self.hotels = []
@@ -1335,6 +1443,10 @@ class CombinedChecker:
                         elif self.recheck == 'all':
                             skip = True
                     
+                    # --only-dates: не перепроверяем отели без корректных дат
+                    if skip and self.only_dates and row.get('check_dates_correct') != 'True':
+                        skip = False  # вернуть в checked — пропустить перепроверку
+                    
                     if skip:
                         recheck_count += 1
                     else:
@@ -1355,6 +1467,10 @@ class CombinedChecker:
             user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         )
         self.context.add_init_script('Object.defineProperty(navigator, "webdriver", {get: () => undefined});')
+        # Блокируем тяжёлые ресурсы (картинки, видео, шрифты) для ускорения загрузки
+        self.context.route('**/*', lambda route: route.abort() 
+            if route.request.resource_type in ('image', 'media', 'font')
+            else route.continue_())
         self.page = self.context.new_page()
     
     def stop_browser(self):
@@ -1521,24 +1637,72 @@ class CombinedChecker:
         return False, round(time.time() - start_time, 1)
     
     def _get_tl_frame(self):
-        """Найти TL iframe: сначала через page.frames, потом через frame_locator."""
+        """Найти TL iframe: ищем фрейм с датами в input (стандартный виджет бронирования)."""
+        DATE_MARKERS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+                        'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря']
+        
         main_frame = self.page.main_frame
+        tl_frames = []
         for frame in self.page.frames:
             if frame == main_frame:
-                continue  # пропускаем главный фрейм (b.tlintegration.com/metasearch)
+                continue
             if 'tlintegration' in frame.url or 'travelline' in frame.url:
-                # Пропускаем reputation-widget, ищем именно booking
                 if 'reputation' in frame.url:
                     continue
-                return ('frame', frame)
+                tl_frames.append(frame)
         
-        # Через frame_locator: сначала booking, потом любой
+        # Среди найденных TL-фреймов ищем тот, где input содержит дату
+        fallback_frame = None
+        for frame in tl_frames:
+            try:
+                inputs = frame.query_selector_all('input')
+                if not inputs:
+                    continue
+                if fallback_frame is None:
+                    fallback_frame = frame
+                for inp in inputs:
+                    try:
+                        val = inp.input_value().lower()
+                        if any(m in val for m in DATE_MARKERS):
+                            return ('frame', frame)
+                    except:
+                        pass
+            except:
+                pass
+        
+        if fallback_frame:
+            return ('frame', fallback_frame)
+        
+        # Через frame_locator: перебираем все TL iframe'ы и ищем с датой в input
         for selector in ['iframe[src*="tlintegration"][src*="booking"]',
                          'iframe[src*="tlintegration"]']:
             try:
-                fl = self.page.frame_locator(selector).first
-                fl.locator('body').wait_for(timeout=2000)
-                return ('locator', fl)
+                count = self.page.locator(selector).count()
+                if count == 0:
+                    continue
+                
+                fallback_locator = None
+                for idx in range(count):
+                    try:
+                        fl = self.page.frame_locator(f'{selector} >> nth={idx}')
+                        fl.locator('body').wait_for(timeout=2000)
+                        inp_count = fl.locator('input').count()
+                        if inp_count == 0:
+                            continue
+                        if fallback_locator is None:
+                            fallback_locator = fl
+                        for i in range(min(inp_count, 3)):
+                            try:
+                                val = fl.locator('input').nth(i).input_value(timeout=1000).lower()
+                                if any(m in val for m in DATE_MARKERS):
+                                    return ('locator', fl)
+                            except:
+                                pass
+                    except:
+                        pass
+                
+                if fallback_locator:
+                    return ('locator', fallback_locator)
             except:
                 pass
         
@@ -1693,6 +1857,11 @@ class CombinedChecker:
             
             widget_loaded, widget_time = self.wait_for_widget(expected_date=arrival_date)
             
+            # Проверяем, не показывает ли виджет "Здесь пока ничего нет"
+            if not widget_loaded and self._check_widget_no_rooms():
+                return {'status': 'no_rooms', 'analysis': None, 'page_title': '',
+                        'error': 'Виджет: Здесь пока ничего нет', 'widget_time': widget_time}
+            
             page_title = self.page.title()
             page_content = self.get_page_text()
             
@@ -1742,6 +1911,43 @@ class CombinedChecker:
                 self.page = self.context.new_page()
             except:
                 pass
+    
+    def _check_widget_no_rooms(self) -> bool:
+        """Проверить, показывает ли виджет TL сообщение 'Здесь пока ничего нет'."""
+        NO_ROOMS_MARKERS = ['здесь пока ничего нет', 'нет доступных']
+        try:
+            main_frame = self.page.main_frame
+            for frame in self.page.frames:
+                if frame == main_frame:
+                    continue
+                if 'tlintegration' in frame.url or 'travelline' in frame.url:
+                    try:
+                        text = frame.locator('body').inner_text(timeout=2000).lower()
+                        for sc in ['\xa0', '\u2009', '\u202f']:
+                            text = text.replace(sc, ' ')
+                        if any(m in text for m in NO_ROOMS_MARKERS):
+                            return True
+                    except:
+                        pass
+            # Также проверяем через frame_locator (cross-origin iframe)
+            for selector in ['iframe[src*="tlintegration"]', 'iframe[src*="travelline"]']:
+                try:
+                    count = self.page.locator(selector).count()
+                    for idx in range(count):
+                        try:
+                            fl = self.page.frame_locator(f'{selector} >> nth={idx}')
+                            text = fl.locator('body').inner_text(timeout=2000).lower()
+                            for sc in ['\xa0', '\u2009', '\u202f']:
+                                text = text.replace(sc, ' ')
+                            if any(m in text for m in NO_ROOMS_MARKERS):
+                                return True
+                        except:
+                            pass
+                except:
+                    pass
+        except:
+            pass
+        return False
     
     def save_result(self, hotel_id: str, hotel_name: str, deeplink: str, 
                     price: float, status: str, analysis: dict, page_title: str, error: str,
@@ -1915,6 +2121,8 @@ class CombinedChecker:
                 
                 if status == 'success':
                     print(f"✅{wt_str}")
+                elif status == 'no_rooms':
+                    print(f"📭{wt_str} нет комнат (виджет)")
                 elif status == 'partial':
                     errors = result['analysis']['error_details'] if result['analysis'] else result['error']
                     print(f"⚠️{wt_str} {errors[:50]}")
@@ -1960,7 +2168,8 @@ def cmd_check(args):
         children_ages=children_ages,
         headless=not args.gui,
         recheck=getattr(args, 'recheck', None),
-        from_csv=getattr(args, 'from_csv', False)
+        from_csv=getattr(args, 'from_csv', False),
+        only_dates=getattr(args, 'only_dates', False)
     )
     
     checker.run(start=args.start, limit=args.limit)
@@ -2247,6 +2456,8 @@ def main():
                               help='Перепроверить: guests/price/failed/all/deeplinks/children')
     check_parser.add_argument('--from-csv', action='store_true',
                               help='Использовать диплинки из CSV вместо API (комбинируется с --recheck)')
+    check_parser.add_argument('--only-dates', action='store_true',
+                              help='Перепроверять только отели с корректными датами (check_dates_correct=True)')
     
     args = parser.parse_args()
     
