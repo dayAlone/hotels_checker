@@ -238,10 +238,25 @@ class PageAnalyzer:
         # Формат в виджете: "1 взрослый, 1 ребёнок" или "2 взрослых"
         # Ищем в snapshot_lower напрямую (работает и для HTML и для YAML)
         
+        # Проверяем, есть ли дети в URL диплинка (tl-children-age не пустой)
+        deeplink_has_children = True
+        if deeplink and children_count > 0:
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(deeplink)
+            qp = parse_qs(parsed.query)
+            url_child_ages = [a for a in qp.get('tl-children-age', []) if a.strip()]
+            if not url_child_ages:
+                deeplink_has_children = False
+        
         # Проверяем есть ли вообще текст про гостей на странице
         has_any_guest_info = any(w in snapshot_lower for w in ['взрослый', 'взрослых', 'гостя', 'гостей'])
         
-        if not has_any_guest_info:
+        if not deeplink_has_children and children_count > 0:
+            # Диплинк получен через фоллбэк без детей — дети не переданы в виджет
+            results['guests_correct'] = True
+            results['guests_info'] = 'no_children_in_deeplink'
+            errors.append(f'Диплинк без детей (фоллбэк): tl-children-age пустой')
+        elif not has_any_guest_info:
             # Виджет не загрузился или текст недоступен — не фейлим проверку
             results['guests_correct'] = True
             results['guests_info'] = 'not_available'
@@ -314,7 +329,6 @@ class PageAnalyzer:
         
         # 8. Проверка возраста детей в URL диплинка
         if deeplink and children_ages:
-            from urllib.parse import urlparse, parse_qs
             parsed_url = urlparse(deeplink)
             query_params = parse_qs(parsed_url.query)
             
@@ -1231,7 +1245,7 @@ class BrowserChecker:
             self.start_browser()
             
             for i, hotel in enumerate(hotels_to_check):
-                print(f"[{i+1}/{len(hotels_to_check)}] {hotel['hotel_name'][:40]}...", end=' ', flush=True)
+                print(f"[{i+1}/{len(hotels_to_check)}] {hotel['hotel_id']} {hotel['hotel_name'][:40]}...", end=' ', flush=True)
                 
                 result = self.check_hotel(hotel)
                 stats[result['status']] = stats.get(result['status'], 0) + 1
@@ -1314,7 +1328,7 @@ class CombinedChecker:
                             skip = True
                         elif self.recheck == 'deeplinks' and (row.get('deeplink') or '').strip():
                             skip = True
-                        elif self.recheck == 'children' and row.get('children_selectable') in ('False', '') and row.get('guests_info') in ('children_as_adults', 'mismatch', 'not_available'):
+                        elif self.recheck == 'children' and row.get('children_selectable') in ('False', '') and row.get('guests_info') in ('children_as_adults', 'mismatch', 'not_available', 'no_children_in_deeplink'):
                             skip = True
                         elif self.recheck == 'children' and row.get('children_selectable') == 'True' and not row.get('children_ages_on_page'):
                             skip = True
@@ -1852,7 +1866,7 @@ class CombinedChecker:
                 hotel_id = hotel['id']
                 hotel_name = hotel['name']
                 
-                print(f"[{idx + 1}/{len(to_check)}] {hotel_name[:30]}...", end=' ')
+                print(f"[{idx + 1}/{len(to_check)}] {hotel_id} {hotel_name[:30]}...", end=' ')
                 
                 # Режим CSV — берём диплинк из CSV, без API
                 if use_csv_deeplinks and hotel_id in csv_deeplinks:
