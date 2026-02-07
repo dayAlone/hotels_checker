@@ -48,6 +48,11 @@ python3 check_deeplinks.py collect --hotels hotels.json --output deeplinks.json
 
 # Только проверка собранных
 PLAYWRIGHT_BROWSERS_PATH=0 python3 check_deeplinks.py auto --deeplinks deeplinks.json --output results.csv
+
+# Синхронизация результатов в Google Sheet
+python3 check_deeplinks.py sync --results deeplinks_results.csv --sheet-url "URL"
+# Или напрямую (URL из .env GOOGLE_SHEET_URL):
+python3 sync_google_sheet.py
 ```
 
 ## Формат входных данных
@@ -152,13 +157,23 @@ PLAYWRIGHT_BROWSERS_PATH=0 python3 check_deeplinks.py check \
   --adults 1 --children 7 --gui --recheck all
 ```
 
+### Синхронизация с Google Sheet
+Скрипт `sync_google_sheet.py` загружает CSV в Google Sheet через OAuth2.
+- Очищает только значения (`worksheet.clear()`), форматирование и условное форматирование сохраняются
+- При первом запуске открывает браузер для авторизации, сохраняет токен в `token.json`
+- Лист определяется по `gid` из URL
+
 ## Переменные окружения
 
 Файл `.env`:
 ```
 TL_AUTH_KEY=base64_encoded_credentials
+GOOGLE_SHEET_URL=https://docs.google.com/spreadsheets/d/...
 ```
 
-Получить ключ: Base64 от `username:password` для TravelLine Partner API.
+- `TL_AUTH_KEY` — Base64 от `username:password` для TravelLine Partner API
+- `GOOGLE_SHEET_URL` — URL таблицы для синхронизации (опционально, можно передать через `--sheet-url`)
+- `credentials.json` — OAuth2 Client ID (Desktop) из Google Cloud Console (не коммитить!)
+- `token.json` — сохранённый токен авторизации (не коммитить!)
 
 **PLAYWRIGHT_BROWSERS_PATH=0** — обязательно при запуске Playwright (указывает на локальные браузеры в venv).

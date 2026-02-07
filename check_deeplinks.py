@@ -2140,6 +2140,27 @@ class CombinedChecker:
         print(f"\n💾 Результаты: {self.results_file}")
 
 
+def cmd_sync(args):
+    """Команда синхронизации CSV → Google Sheet."""
+    from sync_google_sheet import sync, load_env as load_sync_env
+    
+    load_sync_env()
+    
+    sheet_url = args.sheet_url or os.environ.get('GOOGLE_SHEET_URL', '')
+    if not sheet_url:
+        print('❌ Укажите URL Google Sheet через --sheet-url или GOOGLE_SHEET_URL в .env')
+        sys.exit(1)
+    
+    if not os.path.exists(args.results):
+        print(f'❌ CSV файл не найден: {args.results}')
+        sys.exit(1)
+    
+    credentials = os.environ.get('GOOGLE_CREDENTIALS', args.credentials)
+    token = os.environ.get('GOOGLE_TOKEN', args.token)
+    
+    sync(args.results, sheet_url, credentials, token)
+
+
 def cmd_check(args):
     """Команда объединённой проверки (collect + auto)."""
     if not PLAYWRIGHT_AVAILABLE:
@@ -2455,6 +2476,13 @@ def main():
     check_parser.add_argument('--only-dates', action='store_true',
                               help='Перепроверять только отели с корректными датами (check_dates_correct=True)')
     
+    # Команда sync - синхронизация CSV в Google Sheet
+    sync_parser = subparsers.add_parser('sync', help='Загрузить результаты в Google Sheet')
+    sync_parser.add_argument('--results', type=str, default='deeplinks_results.csv', help='CSV файл с результатами')
+    sync_parser.add_argument('--sheet-url', type=str, default='', help='URL Google Sheet')
+    sync_parser.add_argument('--credentials', type=str, default='credentials.json', help='Путь к credentials.json')
+    sync_parser.add_argument('--token', type=str, default='token.json', help='Путь к token.json')
+    
     args = parser.parse_args()
     
     if args.command == 'collect':
@@ -2473,6 +2501,8 @@ def main():
         cmd_merge(args)
     elif args.command == 'check':
         cmd_check(args)
+    elif args.command == 'sync':
+        cmd_sync(args)
     else:
         parser.print_help()
 
