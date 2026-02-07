@@ -179,7 +179,7 @@ python3 check_deeplinks.py report --results results.csv
 | `children_ages_in_url` | Возраст детей совпадает в URL диплинка: `True` / `False` |
 | `children_ages_on_page` | Возраст или лимит возраста на странице (число) |
 | `children_selectable` | Можно ли выбрать детей в виджете: `True` / `False` |
-| `widget_load_time` | Время загрузки виджета TravelLine (секунды) |
+| `widget_load_time` | Полное время проверки страницы: навигация + dismiss overlays + ожидание виджета (секунды) |
 
 ## Логика проверки гостей
 
@@ -200,7 +200,13 @@ python3 check_deeplinks.py report --results results.csv
 4. Дети не найдены, но N взрослых = adults+children?  → «2 взрослых»
    guests_correct=True, guests_info=children_as_adults
 
-5. Ни взрослые, ни дети не найдены
+5. Ни взрослые, ни дети не найдены  → нет поля гостей в виджете
+   guests_correct=True, guests_info=no_guest_input
+
+6. Взрослые найдены, дети нет, нет дропдауна детей  → виджет не поддерживает детей
+   guests_correct=True, guests_info=children_not_supported
+
+7. Прочие несовпадения
    guests_correct=False, guests_info=mismatch
 ```
 
@@ -212,7 +218,9 @@ python3 check_deeplinks.py report --results results.csv
 | `children_as_adults` | `True` | Виджет не различает детей — показывает всех как взрослых (напр. «2 взрослых» вместо «1 взрослый, 1 ребёнок»). Часто из-за возрастного лимита |
 | `not_available` | `True` | На странице нет текста о гостях (виджет не загрузился / нет поля гостей) |
 | `no_children_in_deeplink` | `True` | API не вернул номеров с детьми, диплинк получен через фоллбэк без детей (`tl-children-age` пустой) |
-| `mismatch` | `False` | Гости на странице не совпадают с запросом |
+| `no_guest_input` | `True` | Ни взрослые, ни дети не найдены — виджет без поля ввода гостей |
+| `children_not_supported` | `True` | Взрослые отображаются, но виджет не поддерживает детей (нет дропдауна) |
+| `mismatch` | `False` | Гости на странице не совпадают с запросом (есть дропдаун детей, но данные не совпадают) |
 
 ### Значения `children_selectable`
 

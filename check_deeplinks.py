@@ -302,16 +302,22 @@ class PageAnalyzer:
                     # Виджет не поддерживает детей — считает их как взрослых
                     results['guests_correct'] = True
                     results['guests_info'] = 'children_as_adults'
+                elif not adults_found:
+                    # Ни дети, ни взрослые не найдены — виджет без контрола гостей
+                    results['guests_correct'] = True
+                    results['guests_info'] = 'no_guest_input'
+                elif not guests_dropdown_text:
+                    # Взрослые найдены, но дропдаун гостей пуст — виджет не поддерживает детей
+                    results['guests_correct'] = True
+                    results['guests_info'] = 'children_not_supported'
                 else:
                     results['guests_correct'] = False
                     results['guests_info'] = 'mismatch'
                     errors.append(f'Дети ({children_count}) не найдены в виджете')
-                    if not adults_found:
-                        errors.append(f'Взрослые ({adults}) не найдены в виджете')
             elif not adults_found:
-                results['guests_correct'] = False
-                results['guests_info'] = 'mismatch'
-                errors.append(f'Взрослые ({adults}) не найдены в виджете')
+                # Взрослые не найдены — виджет без контрола гостей
+                results['guests_correct'] = True
+                results['guests_info'] = 'no_guest_input'
         
         # 7. Проверка цены
         if expected_price is not None:
@@ -1510,8 +1516,8 @@ class CombinedChecker:
                 for row in reader:
                     skip = False
                     
-                    # Всегда перепроверяем no_rooms
-                    if row.get('status') == 'no_rooms':
+                    # Всегда перепроверяем no_rooms (кроме --recheck failed)
+                    if row.get('status') == 'no_rooms' and self.recheck != 'failed':
                         skip = True
                     
                     # Перепроверка по флагу --recheck
@@ -1520,7 +1526,9 @@ class CombinedChecker:
                             skip = True
                         elif self.recheck == 'price' and row.get('check_price_correct') == 'False':
                             skip = True
-                        elif self.recheck == 'failed' and row.get('status') in ('failed', 'partial'):
+                        elif self.recheck == 'failed' and row.get('status') == 'failed':
+                            skip = True
+                        elif self.recheck == 'partial' and row.get('status') == 'partial':
                             skip = True
                         elif self.recheck == 'deeplinks' and (row.get('deeplink') or '').strip():
                             skip = True
@@ -1952,6 +1960,7 @@ class CombinedChecker:
         """Проверить страницу отеля."""
         children_count = len(self.children_ages)
         webkit_used = False
+        check_start = time.time()  # общий таймер (навигация + виджет)
         
         try:
             try:
@@ -1973,12 +1982,14 @@ class CombinedChecker:
             # Закрываем оверлеи (cookie-баннеры, accept-диалоги) перед ожиданием виджета
             self._dismiss_overlays()
             
-            widget_loaded, widget_time = self.wait_for_widget(expected_date=arrival_date)
+            widget_loaded, _wt = self.wait_for_widget(expected_date=arrival_date)
+            # Общее время = навигация + dismiss + wait_for_widget
+            total_time = round(time.time() - check_start, 1)
             
             # Проверяем, не показывает ли виджет "Здесь пока ничего нет"
             if not widget_loaded and self._check_widget_no_rooms():
                 return {'status': 'no_rooms', 'analysis': None, 'page_title': '',
-                        'error': 'Виджет: Здесь пока ничего нет', 'widget_time': widget_time}
+                        'error': 'Виджет: Здесь пока ничего нет', 'widget_time': total_time}
             
             page_title = self.page.title()
             page_content = self.get_page_text()
@@ -2009,7 +2020,7 @@ class CombinedChecker:
                 'analysis': analysis,
                 'page_title': page_title,
                 'error': '',
-                'widget_time': widget_time
+                'widget_time': total_time
             }
             
         except PlaywrightTimeout:
@@ -2647,8 +2658,8 @@ def main():
     check_parser.add_argument('--hotels', type=str, default='hotels_id_name.json', help='Файл с отелями')
     check_parser.add_argument('--output', type=str, default='deeplink_results.csv', help='Выходной CSV')
     check_parser.add_argument('--gui', action='store_true', help='Показать окно браузера')
-    check_parser.add_argument('--recheck', type=str, choices=['guests', 'price', 'failed', 'all', 'deeplinks', 'children'],
-                              help='Перепроверить: guests/price/failed/all/deeplinks/children')
+    check_parser.add_argument('--recheck', type=str, choices=['guests', 'price', 'failed', 'partial', 'all', 'deeplinks', 'children'],
+                              help='Перепроверить: guests/price/failed/partial/all/deeplinks/children')
     check_parser.add_argument('--from-csv', action='store_true',
                               help='Использовать диплинки из CSV вместо API (комбинируется с --recheck)')
     check_parser.add_argument('--only-dates', action='store_true',

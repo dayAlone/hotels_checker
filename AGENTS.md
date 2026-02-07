@@ -71,7 +71,7 @@ python3 sync_google_sheet.py
 - `hotel_id`, `hotel_name` — идентификация
 - `status` — success/partial/failed/no_access/no_rooms
 - `check_*` — результаты отдельных проверок (True/False)
-- `guests_info` — детали проверки гостей: `correct`, `mismatch`, `children_as_adults`, `not_available`, `no_children_in_deeplink`
+- `guests_info` — детали проверки гостей: `correct`, `children_as_adults`, `not_available`, `no_children_in_deeplink`, `no_guest_input`, `children_not_supported`, `mismatch`
 - `children_selectable` — `True`/`False` (определяется по тексту гостевого дропдауна)
 - `children_ages_on_page` — числовой возраст или лимит
 - `expected_price` — цена из API
