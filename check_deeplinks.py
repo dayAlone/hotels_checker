@@ -71,23 +71,33 @@ class TokenManager:
         return time.time() >= (self.expires_at - self.buffer)
     
     def _refresh_token(self):
-        """Обновить токен."""
+        """Обновить токен с retry на 429."""
         print("🔄 Получение нового токена...")
-        response = requests.post(
-            self.AUTH_URL,
-            headers={
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Accept': 'application/json',
-                'Authorization': self.AUTH_HEADER
-            },
-            data={'grant_type': 'client_credentials'}
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        self.token = data['access_token']
-        self.expires_at = time.time() + data['expires_in']
-        print(f"✅ Токен получен, истекает через {data['expires_in']} сек")
+        for attempt in range(5):
+            response = requests.post(
+                self.AUTH_URL,
+                headers={
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Accept': 'application/json',
+                    'Authorization': self.AUTH_HEADER
+                },
+                data={'grant_type': 'client_credentials'},
+                timeout=30
+            )
+            if response.status_code == 200:
+                data = response.json()
+                self.token = data['access_token']
+                self.expires_at = time.time() + data['expires_in']
+                print(f"✅ Токен получен, истекает через {data['expires_in']} сек")
+                return
+            elif response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 60))
+                remaining = response.headers.get('X-RateLimit-Remaining-Hour', '?')
+                print(f"⏳ Токен: 429, жду {retry_after}с до сброса (remaining: {remaining})...")
+                time.sleep(retry_after)
+            else:
+                response.raise_for_status()
+        raise Exception("Не удалось получить токен после 5 попыток")
 
 
 class PageAnalyzer:
@@ -495,7 +505,7 @@ class DeeplinkCollector:
         }
         
         for attempt in range(max_retries):
-            response = requests.get(url, params=params, headers=headers)
+            response = requests.get(url, params=params, headers=headers, timeout=30)
             
             if response.status_code == 200:
                 return response.json()
@@ -564,7 +574,7 @@ class DeeplinkCollector:
         }
         
         for attempt in range(max_retries):
-            response = requests.get(url, params=params, headers=headers)
+            response = requests.get(url, params=params, headers=headers, timeout=30)
             
             if response.status_code == 200:
                 return response.json()
@@ -655,8 +665,14 @@ class DeeplinkCollector:
                     if r2.status_code == 200:
                         room_stays = r2.json().get('room_stays', [])
                         if room_stays:
-                            rs = room_stays[0]
-                            ibe_price = rs.get('total', {}).get('price_after_tax')
+                            ibe_price = None
+                            for rs in room_stays:
+                                p = rs.get('total', {}).get('price_after_tax')
+                                if p is not None:
+                                    ibe_price = p
+                                    break
+                            if ibe_price is None:
+                                ibe_price = 0
                             ibe_has_rooms = True
                             ibe_working_variant = (s, e, with_ch, ibe_price)
                             break
@@ -695,7 +711,8 @@ class DeeplinkCollector:
                 for age in self.children_ages:
                     deeplink += f"&childrenAges={age}"
             suffix = "" if wv_ch else " (без детей)"
-            print(f"✅ IBE{suffix}: {wv_price}₽")
+            price_str = f"{wv_price}₽" if wv_price else "цена не указана"
+            print(f"✅ IBE{suffix}: {price_str}")
             return (deeplink, wv_price, wv_s, wv_e)
         except Exception as ex:
             print(f"❌ IBE ошибка: {ex}")
@@ -1774,24 +1791,13 @@ class CombinedChecker:
         API_BASE = 'https://partner.tlintegration.com/api/search'
         
         fallback_dates = [
-            ('2026-02-15', '2026-02-16'),
-            ('2026-02-15', '2026-02-19'),
             ('2026-03-01', '2026-03-02'),
             ('2026-03-01', '2026-03-05'),
-            ('2026-04-01', '2026-04-02'),
-            ('2026-04-01', '2026-04-05'),
-            ('2026-05-01', '2026-05-02'),
-            ('2026-05-01', '2026-05-05'),
             ('2026-06-15', '2026-06-16'),
             ('2026-06-15', '2026-06-19'),
-            ('2026-07-15', '2026-07-16'),
-            ('2026-07-15', '2026-07-19'),
-            ('2026-09-01', '2026-09-02'),
-            ('2026-09-01', '2026-09-05'),
+            ('2026-08-01', '2026-08-02'),
             ('2026-10-01', '2026-10-02'),
             ('2026-10-01', '2026-10-05'),
-            ('2026-11-15', '2026-11-16'),
-            ('2026-12-15', '2026-12-16'),
         ]
         
         # 1. С детьми: основная дата
@@ -1885,8 +1891,15 @@ class CombinedChecker:
                 data = r.json()
                 room_stays = data.get('room_stays', [])
                 if room_stays:
-                    rs = room_stays[0]
-                    price = rs.get('total', {}).get('price_after_tax')
+                    # Ищем первый room_stay с ценой, иначе берём первый
+                    price = None
+                    for rs in room_stays:
+                        p = rs.get('total', {}).get('price_after_tax')
+                        if p is not None:
+                            price = p
+                            break
+                    if price is None:
+                        price = 0  # Номера есть, но цена скрыта (промо-тарифы)
                     
                     # Собираем диплинк через прямой URL TL IBE
                     deeplink = (
@@ -1967,7 +1980,8 @@ class CombinedChecker:
         result = self._ibe_get_rooms(hotel_id, wv_s, wv_e, with_children=wv_ch)
         if result:
             suffix = "" if wv_ch else " (без детей)"
-            print(f"✅ IBE{suffix}: {result[1]}₽")
+            price_str = f"{result[1]}₽" if result[1] else "цена не указана"
+            print(f"✅ IBE{suffix}: {price_str}")
             return result
         
         return None, None, self.arrival_date, self.departure_date
@@ -1991,7 +2005,7 @@ class CombinedChecker:
         
         for attempt in range(max_retries):
             try:
-                response = requests.get(url, params=params, headers=headers)
+                response = requests.get(url, params=params, headers=headers, timeout=30)
                 
                 if response.status_code == 200:
                     data = response.json()
@@ -2008,12 +2022,16 @@ class CombinedChecker:
                     retry_after = int(response.headers.get('Retry-After', 5))
                     
                     if remaining_hour == 0:
-                        # Часовой лимит исчерпан — ждём до полного сброса
-                        wait_time = retry_after + 5  # + небольшой буфер
+                        wait_time = retry_after + 5
                         mins = wait_time // 60
                         secs = wait_time % 60
                         print(f"\n⏳ Часовой лимит исчерпан, жду {mins}м {secs}с до сброса...", end=' ')
+                        try:
+                            self.stop_browser()
+                        except:
+                            pass
                         time.sleep(wait_time)
+                        self.start_browser()
                         print("✅ продолжаю")
                     else:
                         wait_time = min(max(retry_after, 2 ** attempt), 30)
@@ -2709,14 +2727,37 @@ class CombinedChecker:
                     
                     # IBE-only: диплинк ведёт на виджет TL, а не на сайт отеля
                     if 'tlintegration.ru/booking2' in deeplink:
-                        print(f"🔶 IBE-only ({price}₽) [{arrival}]")
+                        price_str = f"{price}₽" if price else "цена не указана"
+                        print(f"🔶 IBE-only ({price_str}) [{arrival}]")
                         self.save_result(hotel_id, hotel_name, deeplink, price, 'ibe_only', None, '',
                                          'Отель не в Partner API, диплинк через TL IBE')
                         stats['ibe_only'] = stats.get('ibe_only', 0) + 1
                         continue
                 
                 # 2. Проверяем страницу
-                result = self.check_hotel(hotel_id, hotel_name, deeplink, price, arrival)
+                try:
+                    result = self.check_hotel(hotel_id, hotel_name, deeplink, price, arrival)
+                except Exception as e:
+                    err_msg = str(e)
+                    if 'EPIPE' in err_msg or 'browser has been closed' in err_msg or 'Target page' in err_msg or 'Connection closed' in err_msg:
+                        print(f"🔄 Playwright упал, перезапускаю браузер...")
+                        try:
+                            self.stop_browser()
+                        except:
+                            pass
+                        self.start_browser()
+                        try:
+                            result = self.check_hotel(hotel_id, hotel_name, deeplink, price, arrival)
+                        except Exception as e2:
+                            print(f"❌ повторная ошибка: {str(e2)[:50]}")
+                            self.save_result(hotel_id, hotel_name, deeplink, price, 'failed', None, '', str(e2)[:200])
+                            stats['failed'] = stats.get('failed', 0) + 1
+                            continue
+                    else:
+                        print(f"❌ {err_msg[:50]}")
+                        self.save_result(hotel_id, hotel_name, deeplink, price, 'failed', None, '', err_msg[:200])
+                        stats['failed'] = stats.get('failed', 0) + 1
+                        continue
                 
                 # 3. Сохраняем результат
                 self.save_result(
